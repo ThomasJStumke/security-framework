@@ -1,0 +1,22 @@
+name: Security (Weekly)
+
+on:
+  schedule:
+    # Staggered off-hours UTC time per-repo to avoid all ~20 repos hitting Mission
+    # Control's ingestion endpoint in the same minute. See security/README.md.
+    - cron: "__CRON__"
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  security:
+    uses: ThomasJStumke/security-framework/.github/workflows/reusable-security-weekly.yml@main
+    with:
+      application-id: __APPLICATION_ID__
+      supabase-enabled: __SUPABASE_ENABLED__
+      scan-url: ${{ vars.SECURITY_SCAN_URL }}
+      mc-security-url: ${{ vars.MC_SECURITY_URL }}
+    secrets:
+      MISSION_CONTROL_SECURITY_TOKEN: ${{ secrets.MISSION_CONTROL_SECURITY_TOKEN }}

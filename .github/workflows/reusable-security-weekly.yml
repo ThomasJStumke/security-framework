@@ -1,0 +1,227 @@
+name: Reusable Security Weekly Scan
+
+on:
+  workflow_call:
+    inputs:
+      application-id:
+        required: true
+        type: string
+      supabase-enabled:
+        required: false
+        type: boolean
+        default: false
+      node-version:
+        required: false
+        type: string
+        default: "20"
+      scan-url:
+        description: "Staging/preview URL for OWASP ZAP baseline scan. Empty = ZAP is skipped (source-code scans still run)."
+        required: false
+        type: string
+        default: ""
+      enable-nuclei:
+        required: false
+        type: boolean
+        default: false
+      mc-security-url:
+        required: false
+        type: string
+        default: ""
+    secrets:
+      MISSION_CONTROL_SECURITY_TOKEN:
+        required: false
+
+permissions:
+  contents: read
+
+jobs:
+  gitleaks-history:
+    name: Gitleaks (full git history)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Run Gitleaks against full history
+        run: |
+          mkdir -p .security-reports
+          docker run --rm -v "$PWD:/repo" zricethezav/gitleaks:v8.18.4 detect \
+            --source=/repo --report-format=json --report-path=/repo/.security-reports/gitleaks.json --exit-code=0 || true
+        continue-on-error: true
+      - uses: actions/upload-artifact@v4
+        with:
+          name: security-gitleaks
+          path: .security-reports/gitleaks.json
+          retention-days: 90
+
+  semgrep:
+    name: Semgrep CE (full SAST)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    container:
+      image: semgrep/semgrep:1.78.0
+    steps:
+      - uses: actions/checkout@v4
+      - run: |
+          mkdir -p .security-reports
+          semgrep scan \
+            --config p/security-audit --config p/secrets --config p/owasp-top-ten \
+            --config p/typescript --config p/react \
+            --json --output=.security-reports/semgrep.json --error || true
+        continue-on-error: true
+      - uses: actions/upload-artifact@v4
+        with:
+          name: security-semgrep
+          path: .security-reports/semgrep.json
+          retention-days: 90
+
+  trivy:
+    name: Trivy (dependencies/config)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: aquasecurity/trivy-action@0.24.0
+        with:
+          scan-type: fs
+          scan-ref: .
+          format: json
+          output: .security-reports/trivy.json
+          severity: "CRITICAL,HIGH,MEDIUM,LOW,UNKNOWN"
+          exit-code: "0"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: security-trivy
+          path: .security-reports/trivy.json
+          retention-days: 90
+
+  dependency-audit:
+    name: Dependency audit
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node-version }}
+      - run: npm install --package-lock-only --ignore-scripts || true
+      - run: |
+          mkdir -p .security-reports
+          npm audit --json --package-lock-only > .security-reports/npm-audit.json || true
+      - uses: actions/upload-artifact@v4
+        with:
+          name: security-dependency-audit
+          path: .security-reports/npm-audit.json
+          retention-days: 90
+
+  supabase-check:
+    name: Supabase/RLS static check
+    if: ${{ inputs.supabase-enabled }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: ThomasJStumke/security-framework
+          path: .security-framework
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node-version }}
+      - run: node .security-framework/scripts/supabase-check.mjs . .security-reports/supabase-check.json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: security-supabase
+          path: .security-reports/supabase-check.json
+          retention-days: 90
+
+  zap-baseline:
+    name: OWASP ZAP baseline
+    if: ${{ inputs.scan-url != '' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - name: ZAP Baseline Scan
+        uses: zaproxy/action-baseline@v0.13.0
+        with:
+          target: ${{ inputs.scan-url }}
+          cmd_options: "-a -j"
+          fail_action: false
+          artifact_name: security-zap
+      - run: |
+          mkdir -p .security-reports
+          [ -f report_json.json ] && cp report_json.json .security-reports/zap-baseline.json || true
+      - uses: actions/upload-artifact@v4
+        with:
+          name: security-zap-normalized
+          path: .security-reports/zap-baseline.json
+          retention-days: 90
+          if-no-files-found: ignore
+
+  # Nuclei is intentionally NOT wired up yet — see security/README.md "Nuclei" section
+  # for why, and what's needed to turn this on safely (non-destructive template set +
+  # a vetted target list). Flip `enable-nuclei: true` only after that review.
+  nuclei-placeholder:
+    name: Nuclei (deferred)
+    if: ${{ inputs.enable-nuclei }}
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "Nuclei is not implemented yet in the shared framework — enable-nuclei was set true but there is nothing to run. See security/README.md."
+
+  normalize-and-submit:
+    name: Normalize + submit to Mission Control
+    needs: [gitleaks-history, semgrep, trivy, dependency-audit, supabase-check, zap-baseline]
+    if: ${{ always() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: ThomasJStumke/security-framework
+          path: .security-framework
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node-version }}
+      - uses: actions/download-artifact@v4
+        with:
+          path: .security-reports-raw
+      - run: |
+          mkdir -p .security-reports
+          find .security-reports-raw -type f -name "*.json" -exec cp {} .security-reports/ \;
+          ls -la .security-reports
+      - env:
+          REPORTS_DIR: .security-reports
+          REPO_OWNER: ${{ github.repository_owner }}
+          REPO_NAME: ${{ github.event.repository.name }}
+          MC_APPLICATION_ID: ${{ inputs.application-id }}
+          MC_SECURITY_URL: ${{ inputs.mc-security-url }}
+          MISSION_CONTROL_SECURITY_TOKEN: ${{ secrets.MISSION_CONTROL_SECURITY_TOKEN }}
+          SCAN_TYPE: weekly
+          SCAN_ENVIRONMENT: ${{ inputs.scan-url != '' && 'staging' || 'ci' }}
+          SCAN_STARTED_AT: ${{ github.event.repository.updated_at }}
+          COMMIT_SHA: ${{ github.sha }}
+          BRANCH: ${{ github.ref_name }}
+          GITHUB_RUN_ID: ${{ github.run_id }}
+          GITHUB_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: node .security-framework/scripts/normalize-and-submit.mjs
+      - uses: actions/upload-artifact@v4
+        with:
+          name: security-normalized-summary
+          path: .security-reports/normalized-payload.json
+          retention-days: 90

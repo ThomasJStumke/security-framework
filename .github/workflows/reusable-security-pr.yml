@@ -1,0 +1,229 @@
+name: Reusable Security PR Scan
+
+on:
+  workflow_call:
+    inputs:
+      application-id:
+        description: "Loose text app id matching Mission Control's mc_repositories.application_id"
+        required: true
+        type: string
+      supabase-enabled:
+        required: false
+        type: boolean
+        default: false
+      node-version:
+        required: false
+        type: string
+        default: "20"
+      fail-on-severity:
+        description: "Minimum severity that fails the PR check: critical | high | none"
+        required: false
+        type: string
+        default: "high"
+      mc-security-url:
+        description: "Mission Control ingestion endpoint. Leave empty to skip submission (report is still uploaded as an artifact)."
+        required: false
+        type: string
+        default: ""
+    secrets:
+      MISSION_CONTROL_SECURITY_TOKEN:
+        required: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: security-pr-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  gitleaks:
+    name: Gitleaks (secrets)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    outputs:
+      status: ${{ steps.summarize.outputs.status }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+      - name: Run Gitleaks (current working tree — history scan is weekly-only)
+        run: |
+          mkdir -p .security-reports
+          docker run --rm -v "$PWD:/repo" zricethezav/gitleaks:v8.18.4 detect \
+            --source=/repo --report-format=json --report-path=/repo/.security-reports/gitleaks.json --no-git --exit-code=0 || true
+        continue-on-error: true
+      - id: summarize
+        run: |
+          if [ -f .security-reports/gitleaks.json ] && [ "$(jq 'length' .security-reports/gitleaks.json 2>/dev/null || echo 0)" != "0" ]; then
+            echo "status=findings" >> "$GITHUB_OUTPUT"
+          else
+            echo "status=passed" >> "$GITHUB_OUTPUT"
+          fi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: security-gitleaks
+          path: .security-reports/
+          retention-days: 30
+
+  semgrep:
+    name: Semgrep CE (SAST)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    container:
+      image: semgrep/semgrep:1.78.0
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run Semgrep
+        run: |
+          mkdir -p .security-reports
+          semgrep scan \
+            --config p/security-audit \
+            --config p/secrets \
+            --config p/owasp-top-ten \
+            --json --output=.security-reports/semgrep.json \
+            --error || true
+        continue-on-error: true
+      - uses: actions/upload-artifact@v4
+        with:
+          name: security-semgrep
+          path: .security-reports/semgrep.json
+          retention-days: 30
+
+  trivy:
+    name: Trivy (dependencies/config)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run Trivy filesystem scan
+        uses: aquasecurity/trivy-action@0.24.0
+        with:
+          scan-type: fs
+          scan-ref: .
+          format: json
+          output: .security-reports/trivy.json
+          severity: "CRITICAL,HIGH,MEDIUM,LOW"
+          exit-code: "0"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: security-trivy
+          path: .security-reports/trivy.json
+          retention-days: 30
+
+  dependency-audit:
+    name: Dependency audit
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node-version }}
+      - name: Generate lockfile for audit (no full install)
+        run: npm install --package-lock-only --ignore-scripts || true
+      - name: npm audit
+        run: |
+          mkdir -p .security-reports
+          npm audit --json --package-lock-only > .security-reports/npm-audit.json || true
+      - uses: actions/upload-artifact@v4
+        with:
+          name: security-dependency-audit
+          path: .security-reports/npm-audit.json
+          retention-days: 30
+
+  supabase-check:
+    name: Supabase/RLS static check
+    if: ${{ inputs.supabase-enabled }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: ThomasJStumke/security-framework
+          path: .security-framework
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node-version }}
+      - run: node .security-framework/scripts/supabase-check.mjs . .security-reports/supabase-check.json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: security-supabase
+          path: .security-reports/supabase-check.json
+          retention-days: 30
+
+  normalize-and-submit:
+    name: Normalize + submit to Mission Control
+    needs: [gitleaks, semgrep, trivy, dependency-audit, supabase-check]
+    if: ${{ always() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: ThomasJStumke/security-framework
+          path: .security-framework
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node-version }}
+      - name: Download all scanner artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: .security-reports-raw
+      - name: Flatten artifacts into .security-reports
+        run: |
+          mkdir -p .security-reports
+          find .security-reports-raw -type f \( -name "*.json" -o -name "*.sarif" \) -exec cp {} .security-reports/ \;
+          ls -la .security-reports
+      - name: Normalize and submit
+        env:
+          REPORTS_DIR: .security-reports
+          REPO_OWNER: ${{ github.repository_owner }}
+          REPO_NAME: ${{ github.event.repository.name }}
+          MC_APPLICATION_ID: ${{ inputs.application-id }}
+          MC_SECURITY_URL: ${{ inputs.mc-security-url }}
+          MISSION_CONTROL_SECURITY_TOKEN: ${{ secrets.MISSION_CONTROL_SECURITY_TOKEN }}
+          SCAN_TYPE: pr
+          SCAN_ENVIRONMENT: ci
+          SCAN_STARTED_AT: ${{ github.event.pull_request.created_at || github.event.head_commit.timestamp }}
+          COMMIT_SHA: ${{ github.sha }}
+          BRANCH: ${{ github.head_ref || github.ref_name }}
+          GITHUB_RUN_ID: ${{ github.run_id }}
+          GITHUB_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: node .security-framework/scripts/normalize-and-submit.mjs
+      - uses: actions/upload-artifact@v4
+        with:
+          name: security-normalized-summary
+          path: .security-reports/normalized-payload.json
+          retention-days: 90
+      - name: Enforce severity gate
+        env:
+          FAIL_ON: ${{ inputs.fail-on-severity }}
+        run: |
+          node -e '
+            const fs = require("fs");
+            const p = JSON.parse(fs.readFileSync(".security-reports/normalized-payload.json", "utf8"));
+            const failOn = process.env.FAIL_ON;
+            if (failOn === "none") { console.log("Severity gate disabled."); process.exit(0); }
+            const order = ["critical","high","medium","low","informational"];
+            const threshold = order.indexOf(failOn);
+            const blocking = order.slice(0, threshold + 1).reduce((n, s) => n + (p.counts[s] || 0), 0);
+            console.log(`Findings at or above "${failOn}": ${blocking}`);
+            if (blocking > 0) {
+              console.error(`Blocking PR: ${blocking} finding(s) at severity "${failOn}" or above. See the security-normalized-summary artifact for details.`);
+              process.exit(1);
+            }
+          '
