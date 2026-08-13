@@ -53,7 +53,10 @@ function stripSqlComments(sql) {
 async function main() {
   const findings = [];
   const migrationsDir = path.join(repoRoot, "supabase", "migrations");
-  const sqlFiles = await walk(migrationsDir, (n) => n.endsWith(".sql"));
+  // Migration filenames are timestamp-prefixed, so a lexical sort is chronological order —
+  // required so DROP POLICY statements in a later migration can retire policies a table's
+  // earlier migration created (see live-policy tracking below).
+  const sqlFiles = (await walk(migrationsDir, (n) => n.endsWith(".sql"))).sort();
 
   if (sqlFiles.length === 0) {
     await writeOut([]);
@@ -62,8 +65,15 @@ async function main() {
 
   const tablesCreated = new Map(); // table -> file
   const rlsEnabled = new Set();
-  const policiesByTable = new Map(); // table -> Set of commands ('select'|'insert'|'update'|'delete'|'all')
+  // table -> Map<policyName, {cmd, permissive, rel}> — a *live* view of policies still in
+  // effect after replaying every CREATE/DROP POLICY in chronological order. Without this,
+  // a policy a later migration DROPs and replaces with a stricter one still shows up as
+  // permissive forever, because its CREATE POLICY text never leaves the migration history.
+  const livePoliciesByTable = new Map();
   const securityDefinerFns = [];
+
+  const policyStmt =
+    /(create|drop)\s+policy\s+(?:if\s+exists\s+)?(?:"([^"]+)"|(\S+))\s+on\s+(?:public\.)?["`]?(\w+)["`]?([\s\S]*?);/gi;
 
   for (const file of sqlFiles) {
     const sql = stripSqlComments(await readFile(file, "utf8"));
@@ -75,31 +85,49 @@ async function main() {
     for (const m of sql.matchAll(/alter\s+table\s+(?:public\.)?["`]?(\w+)["`]?\s+enable\s+row\s+level\s+security/gi)) {
       rlsEnabled.add(m[1]);
     }
-    for (const m of sql.matchAll(/create\s+policy\s+.+?\s+on\s+(?:public\.)?["`]?(\w+)["`]?([\s\S]*?);/gi)) {
-      const table = m[1];
-      const body = m[2].toLowerCase();
+    for (const m of sql.matchAll(policyStmt)) {
+      const verb = m[1].toLowerCase();
+      const name = (m[2] ?? m[3] ?? "").toLowerCase();
+      const table = m[4];
+      if (!livePoliciesByTable.has(table)) livePoliciesByTable.set(table, new Map());
+      const tablePolicies = livePoliciesByTable.get(table);
+
+      if (verb === "drop") {
+        if (name) tablePolicies.delete(name);
+        continue;
+      }
+
+      const body = (m[5] ?? "").toLowerCase();
       const cmdMatch = body.match(/for\s+(select|insert|update|delete|all)/);
       const cmd = cmdMatch ? cmdMatch[1] : "all";
-      if (!policiesByTable.has(table)) policiesByTable.set(table, new Set());
-      policiesByTable.get(table).add(cmd);
-
-      if (/using\s*\(\s*true\s*\)/.test(body) || /with\s+check\s*\(\s*true\s*\)/.test(body)) {
-        findings.push({
-          scanner: "supabase-check",
-          fingerprint: fingerprint(["supabase-permissive-policy", table, cmd, rel]),
-          severity: "high",
-          title: `Overly permissive RLS policy on "${table}"`,
-          description: `A policy on "${table}" uses USING (true) or WITH CHECK (true) for ${cmd.toUpperCase()}, allowing any authenticated (or anonymous, depending on role grants) request through with no row-level restriction.`,
-          security_category: "Supabase/RLS",
-          file_path: rel,
-          remediation: "Confirm this table is genuinely intended to be fully public for this operation. If not, scope the policy to the owning user/organization/tenant.",
-          metadata: { table, command: cmd },
-        });
-      }
+      const permissive = /using\s*\(\s*true\s*\)/.test(body) || /with\s+check\s*\(\s*true\s*\)/.test(body);
+      tablePolicies.set(name || `${cmd}:${tablePolicies.size}`, { cmd, permissive, rel });
     }
     for (const m of sql.matchAll(/create\s+(?:or\s+replace\s+)?function\s+(?:public\.)?["`]?(\w+)["`]?[\s\S]{0,500}?security\s+definer/gi)) {
       securityDefinerFns.push({ name: m[1], file: rel });
     }
+  }
+
+  const policiesByTable = new Map(); // table -> Set of commands ('select'|'insert'|'update'|'delete'|'all'), from LIVE policies only
+  for (const [table, tablePolicies] of livePoliciesByTable) {
+    const cmds = new Set();
+    for (const [, policy] of tablePolicies) {
+      cmds.add(policy.cmd);
+      if (policy.permissive) {
+        findings.push({
+          scanner: "supabase-check",
+          fingerprint: fingerprint(["supabase-permissive-policy", table, policy.cmd, policy.rel]),
+          severity: "high",
+          title: `Overly permissive RLS policy on "${table}"`,
+          description: `A currently-live policy on "${table}" uses USING (true) or WITH CHECK (true) for ${policy.cmd.toUpperCase()}, allowing any authenticated (or anonymous, depending on role grants) request through with no row-level restriction.`,
+          security_category: "Supabase/RLS",
+          file_path: policy.rel,
+          remediation: "Confirm this table is genuinely intended to be fully public for this operation. If not, scope the policy to the owning user/organization/tenant.",
+          metadata: { table, command: policy.cmd },
+        });
+      }
+    }
+    policiesByTable.set(table, cmds);
   }
 
   for (const [table, file] of tablesCreated) {
