@@ -263,6 +263,7 @@ async function main() {
       authorization: `Bearer ${token}`,
     },
     body: JSON.stringify(payload),
+    signal: AbortSignal.timeout(60_000),
   });
 
   if (!res.ok) {
