@@ -36,6 +36,20 @@ function fingerprint(parts) {
   return hash.toString(16).padStart(16, "0");
 }
 
+// Strips `--` line comments before any SQL is regex-matched. Without this, narrative
+// comment text like "...CREATE TABLE IF NOT EXISTS never actually ran..." gets misread
+// as a real CREATE TABLE statement. Best-effort: doesn't account for `--` inside a
+// string literal, which is rare enough in migration SQL to accept.
+function stripSqlComments(sql) {
+  return sql
+    .split("\n")
+    .map((line) => {
+      const idx = line.indexOf("--");
+      return idx === -1 ? line : line.slice(0, idx);
+    })
+    .join("\n");
+}
+
 async function main() {
   const findings = [];
   const migrationsDir = path.join(repoRoot, "supabase", "migrations");
@@ -52,7 +66,7 @@ async function main() {
   const securityDefinerFns = [];
 
   for (const file of sqlFiles) {
-    const sql = await readFile(file, "utf8");
+    const sql = stripSqlComments(await readFile(file, "utf8"));
     const rel = path.relative(repoRoot, file);
 
     for (const m of sql.matchAll(/create\s+table\s+(?:if\s+not\s+exists\s+)?(?:public\.)?["`]?(\w+)["`]?/gi)) {
@@ -61,7 +75,7 @@ async function main() {
     for (const m of sql.matchAll(/alter\s+table\s+(?:public\.)?["`]?(\w+)["`]?\s+enable\s+row\s+level\s+security/gi)) {
       rlsEnabled.add(m[1]);
     }
-    for (const m of sql.matchAll(/create\s+policy\s+.+?\s+on\s+(?:public\.)?["`]?(\w+)["`]?([\s\S]{0,300}?);/gi)) {
+    for (const m of sql.matchAll(/create\s+policy\s+.+?\s+on\s+(?:public\.)?["`]?(\w+)["`]?([\s\S]*?);/gi)) {
       const table = m[1];
       const body = m[2].toLowerCase();
       const cmdMatch = body.match(/for\s+(select|insert|update|delete|all)/);
@@ -148,12 +162,20 @@ async function main() {
   }
 
   // Client-side service-role exposure check — scan non-.server.ts/.server.tsx source files.
+  // Excludes test files (never shipped to the browser, and commonly reference "service_role"
+  // in mock SQL/descriptions when testing that a bypass is blocked) and known framework
+  // server-entry filenames that don't follow the *.server.ts convention but are never
+  // bundled client-side either (e.g. TanStack Start's src/server.ts SSR bootstrap).
+  const FRAMEWORK_SERVER_ENTRY_PATHS = new Set(["src/server.ts", "src/server.tsx", "src/start.ts", "src/start.tsx"]);
+  const isTestFile = (relPath) => /\.(test|spec)\.[jt]sx?$/.test(relPath) || /(^|\/)__tests__\//.test(relPath);
   const srcDir = path.join(repoRoot, "src");
   const clientFiles = await walk(
     srcDir,
     (n) => (n.endsWith(".ts") || n.endsWith(".tsx") || n.endsWith(".js") || n.endsWith(".jsx")) && !n.includes(".server."),
   );
   for (const file of clientFiles) {
+    const rel = path.relative(repoRoot, file).replace(/\\/g, "/");
+    if (isTestFile(rel) || FRAMEWORK_SERVER_ENTRY_PATHS.has(rel)) continue;
     const content = await readFile(file, "utf8").catch(() => "");
     if (/service_role/i.test(content) || /SUPABASE_SERVICE_ROLE_KEY/.test(content)) {
       findings.push({
