@@ -102,6 +102,7 @@ jobs:
       contents: read
     steps:
       - uses: actions/checkout@v4
+      - run: mkdir -p .security-reports
       - name: Run Trivy filesystem scan
         uses: aquasecurity/trivy-action@v0.36.0
         with:

@@ -88,6 +88,7 @@ jobs:
       contents: read
     steps:
       - uses: actions/checkout@v4
+      - run: mkdir -p .security-reports
       - uses: aquasecurity/trivy-action@v0.36.0
         with:
           scan-type: fs
