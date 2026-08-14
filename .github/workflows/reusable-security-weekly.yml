@@ -15,11 +15,16 @@ on:
         type: string
         default: "20"
       scan-url:
-        description: "Staging/preview URL for OWASP ZAP baseline scan. Empty = ZAP is skipped (source-code scans still run)."
+        description: "Staging/preview URL for OWASP ZAP baseline / Nuclei / Nmap. Empty = all three are skipped (source-code scans still run)."
         required: false
         type: string
         default: ""
       enable-nuclei:
+        required: false
+        type: boolean
+        default: true
+      enable-nmap:
+        description: "Most apps in this fleet are serverless behind Cloudflare/Vercel, where a port scan only reveals the edge, not the app — default false. Opt in per-repo only for confirmed non-serverless/self-hosted infrastructure (e.g. a homelab box behind a Cloudflare Tunnel with its own exposed origin)."
         required: false
         type: boolean
         default: false
@@ -34,6 +39,10 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: security-weekly-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
   gitleaks-history:
     name: Gitleaks (full git history)
@@ -42,7 +51,7 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           fetch-depth: 0
       - name: Run Gitleaks against full history
@@ -51,7 +60,7 @@ jobs:
           docker run --rm -v "$PWD:/repo" zricethezav/gitleaks:v8.18.4 detect \
             --source=/repo --report-format=json --report-path=/repo/.security-reports/gitleaks.json --exit-code=0 || true
         continue-on-error: true
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: security-gitleaks
           path: .security-reports/gitleaks.json
@@ -66,7 +75,7 @@ jobs:
     container:
       image: semgrep/semgrep:1.78.0
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - run: |
           mkdir -p .security-reports
           semgrep scan \
@@ -74,34 +83,46 @@ jobs:
             --config p/typescript --config p/react \
             --json --output=.security-reports/semgrep.json --error || true
         continue-on-error: true
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: security-semgrep
           path: .security-reports/semgrep.json
           retention-days: 90
 
   trivy:
-    name: Trivy (dependencies/config)
+    name: Trivy (dependencies/config/IaC/Docker)
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - run: mkdir -p .security-reports
-      - uses: aquasecurity/trivy-action@v0.36.0
+      - uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         with:
           scan-type: fs
           scan-ref: .
+          scanners: "vuln,secret,misconfig"
           format: json
           output: .security-reports/trivy.json
           severity: "CRITICAL,HIGH,MEDIUM,LOW,UNKNOWN"
           exit-code: "0"
-      - uses: actions/upload-artifact@v4
+      - name: Trivy Docker image scan (only if this repo builds a Dockerfile)
+        if: ${{ hashFiles('Dockerfile', '**/Dockerfile') != '' }}
+        run: |
+          DOCKERFILE=$(find . -maxdepth 3 -iname 'Dockerfile' | head -1)
+          docker build -t security-scan-target:local -f "$DOCKERFILE" . || { echo "Docker build failed — skipping image scan, filesystem scan above still covers Dockerfile misconfig." > .security-reports/trivy-image.skipped; exit 0; }
+          docker run --rm -v "$PWD/.security-reports:/out" -v /var/run/docker.sock:/var/run/docker.sock \
+            aquasec/trivy:latest image --format json --output /out/trivy-image.json --severity CRITICAL,HIGH,MEDIUM,LOW --exit-code 0 security-scan-target:local || true
+        continue-on-error: true
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: security-trivy
-          path: .security-reports/trivy.json
+          path: |
+            .security-reports/trivy.json
+            .security-reports/trivy-image.json
           retention-days: 90
+          if-no-files-found: ignore
 
   dependency-audit:
     name: Dependency audit
@@ -110,18 +131,44 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: ${{ inputs.node-version }}
-      - run: npm install --package-lock-only --ignore-scripts || true
-      - run: |
+      - name: Detect package manager and run appropriate audit
+        run: |
+          set +e
           mkdir -p .security-reports
-          npm audit --json --package-lock-only > .security-reports/npm-audit.json || true
-      - uses: actions/upload-artifact@v4
+          if [ -f pnpm-lock.yaml ]; then
+            echo "pnpm" > .security-reports/dependency-audit.manager
+            corepack enable
+            corepack prepare pnpm@latest --activate
+            pnpm audit --json > .security-reports/dependency-audit.json 2>/dev/null
+          elif [ -f yarn.lock ]; then
+            echo "yarn" > .security-reports/dependency-audit.manager
+            corepack enable
+            yarn audit --json > .security-reports/dependency-audit.json 2>/dev/null
+          elif [ -f requirements.txt ] || [ -f pyproject.toml ] || [ -f Pipfile ]; then
+            echo "pip-audit" > .security-reports/dependency-audit.manager
+            pip install --quiet pip-audit
+            if [ -f requirements.txt ]; then
+              pip-audit -r requirements.txt -f json -o .security-reports/dependency-audit.json
+            else
+              pip-audit -f json -o .security-reports/dependency-audit.json
+            fi
+          else
+            echo "npm" > .security-reports/dependency-audit.manager
+            npm install --package-lock-only --ignore-scripts
+            npm audit --json --package-lock-only > .security-reports/dependency-audit.json
+          fi
+          [ -s .security-reports/dependency-audit.json ] || echo '{}' > .security-reports/dependency-audit.json
+          exit 0
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: security-dependency-audit
-          path: .security-reports/npm-audit.json
+          path: |
+            .security-reports/dependency-audit.json
+            .security-reports/dependency-audit.manager
           retention-days: 90
 
   supabase-check:
@@ -132,16 +179,16 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           repository: ThomasJStumke/security-framework
           path: .security-framework
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: ${{ inputs.node-version }}
       - run: node .security-framework/scripts/supabase-check.mjs . .security-reports/supabase-check.json
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: security-supabase
           path: .security-reports/supabase-check.json
@@ -155,9 +202,9 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@v4
-      - name: ZAP Baseline Scan
-        uses: zaproxy/action-baseline@v0.15.0
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: ZAP Baseline Scan (passive only — no active/attack rules)
+        uses: zaproxy/action-baseline@de8ad967d3548d44ef623df22cf95c3b0baf8b25 # v0.15.0
         with:
           target: ${{ inputs.scan-url }}
           cmd_options: "-a -j"
@@ -166,45 +213,115 @@ jobs:
       - run: |
           mkdir -p .security-reports
           [ -f report_json.json ] && cp report_json.json .security-reports/zap-baseline.json || true
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: security-zap-normalized
           path: .security-reports/zap-baseline.json
           retention-days: 90
           if-no-files-found: ignore
 
-  # Nuclei is intentionally NOT wired up yet — see security/README.md "Nuclei" section
-  # for why, and what's needed to turn this on safely (non-destructive template set +
-  # a vetted target list). Flip `enable-nuclei: true` only after that review.
-  nuclei-placeholder:
-    name: Nuclei (deferred)
-    if: ${{ inputs.enable-nuclei }}
+  nuclei:
+    name: Nuclei (safe, non-destructive templates)
+    if: ${{ inputs.scan-url != '' && inputs.enable-nuclei }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Run Nuclei against confirmed app URL only
+        run: |
+          mkdir -p .security-reports
+          # Vetted, explicitly non-destructive template tags only:
+          #   exposed-panels, exposures, misconfiguration, headers/security-headers, ssl,
+          #   technologies (fingerprinting) and default-logins-detection *without* credential
+          #   submission (Nuclei's default-login templates are read-only checks against known
+          #   default-creds banners; they don't POST attempted logins).
+          # Explicitly excluded: dast, fuzz, intrusive, takeover (some are destructive-adjacent),
+          #   and anything tagged "dos".
+          docker run --rm -v "$PWD/.security-reports:/out" projectdiscovery/nuclei:v3.11.1 \
+            -u "${{ inputs.scan-url }}" \
+            -tags exposed-panels,exposure,misconfig,headers,ssl,tech \
+            -etags dos,fuzz,intrusive,takeover \
+            -severity info,low,medium,high,critical \
+            -rl 20 -c 10 \
+            -jsonl -o /out/nuclei.jsonl \
+            -no-interactsh \
+            -silent || true
+        continue-on-error: true
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: security-nuclei
+          path: .security-reports/nuclei.jsonl
+          retention-days: 90
+          if-no-files-found: ignore
+
+  nuclei-not-configured:
+    name: Nuclei (skipped — no scan-url)
+    if: ${{ inputs.scan-url == '' || !inputs.enable-nuclei }}
     runs-on: ubuntu-latest
     steps:
-      - run: echo "Nuclei is not implemented yet in the shared framework — enable-nuclei was set true but there is nothing to run. See security/README.md."
+      - run: echo "Nuclei skipped — no SECURITY_SCAN_URL configured for this repo, or enable-nuclei is false. Source-code/dependency scans above are unaffected."
+
+  nmap:
+    name: Nmap (conservative exposure check)
+    if: ${{ inputs.scan-url != '' && inputs.enable-nmap }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - name: Conservative top-ports discovery scan (no NSE scripts, no exploits, no brute force)
+        run: |
+          set -e
+          HOST=$(node -e "console.log(new URL(process.env.SCAN_URL).hostname)")
+          echo "Target host: $HOST (derived from configured SECURITY_SCAN_URL — never guessed)"
+          sudo apt-get update -qq && sudo apt-get install -y -qq nmap
+          mkdir -p .security-reports
+          # -Pn: skip host discovery (many app hosts block ICMP). --top-ports 100: common ports
+          # only. -T3: default polite timing. No -sV banner grab beyond default, no --script,
+          # no -A, no brute-force/vuln NSE categories. Read-only TCP connect/SYN probing only.
+          nmap -Pn --top-ports 100 -T3 -oX .security-reports/nmap.xml "$HOST" || true
+        env:
+          SCAN_URL: ${{ inputs.scan-url }}
+        continue-on-error: true
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: security-nmap
+          path: .security-reports/nmap.xml
+          retention-days: 90
+          if-no-files-found: ignore
+
+  nmap-not-applicable:
+    name: Nmap (not applicable — no scan-url / serverless target)
+    if: ${{ inputs.scan-url == '' || !inputs.enable-nmap }}
+    runs-on: ubuntu-latest
+    steps:
+      - run: |
+          echo 'Nmap N/A -- no SECURITY_SCAN_URL configured, or enable-nmap is false (the default). Most apps here are serverless behind Cloudflare/Vercel, where a port scan only reveals the edge network, not the app, so this is off by default. Set enable-nmap: true per-repo only for confirmed non-serverless/self-hosted infrastructure.'
 
   normalize-and-submit:
     name: Normalize + submit to Mission Control
-    needs: [gitleaks-history, semgrep, trivy, dependency-audit, supabase-check, zap-baseline]
+    needs: [gitleaks-history, semgrep, trivy, dependency-audit, supabase-check, zap-baseline, nuclei, nmap]
     if: ${{ always() }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           repository: ThomasJStumke/security-framework
           path: .security-framework
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: ${{ inputs.node-version }}
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           path: .security-reports-raw
       - run: |
           mkdir -p .security-reports
-          find .security-reports-raw -type f -name "*.json" -exec cp {} .security-reports/ \;
+          find .security-reports-raw -type f \( -name "*.json" -o -name "*.jsonl" -o -name "*.xml" -o -name "*.manager" \) -exec cp {} .security-reports/ \;
           ls -la .security-reports
       - env:
           REPORTS_DIR: .security-reports
@@ -215,13 +332,14 @@ jobs:
           MISSION_CONTROL_SECURITY_TOKEN: ${{ secrets.MISSION_CONTROL_SECURITY_TOKEN }}
           SCAN_TYPE: weekly
           SCAN_ENVIRONMENT: ${{ inputs.scan-url != '' && 'staging' || 'ci' }}
+          SCAN_URL: ${{ inputs.scan-url }}
           SCAN_STARTED_AT: ${{ github.event.repository.updated_at }}
           COMMIT_SHA: ${{ github.sha }}
           BRANCH: ${{ github.ref_name }}
           GITHUB_RUN_ID: ${{ github.run_id }}
           GITHUB_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: node .security-framework/scripts/normalize-and-submit.mjs
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: security-normalized-summary
           path: .security-reports/normalized-payload.json

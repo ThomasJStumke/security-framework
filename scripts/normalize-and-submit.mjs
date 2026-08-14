@@ -142,14 +142,14 @@ function normalizeTrivy(report) {
   return { findings, status: findings.length ? "findings" : "passed" };
 }
 
-// ---- npm audit ----
-function normalizeNpmAudit(report) {
+// ---- npm / pnpm audit (both use the same `vulnerabilities` map shape) ----
+function normalizeNpmAudit(report, scanner = "npm-audit") {
   const vulns = report?.vulnerabilities;
   if (!vulns) return { findings: [], status: "passed" };
   const findings = Object.entries(vulns).map(([name, v]) => ({
-    scanner: "npm-audit",
+    scanner,
     external_finding_id: `${name}@${v.range}`,
-    fingerprint: fingerprint(["npm-audit", name, v.range]),
+    fingerprint: fingerprint([scanner, name, v.range]),
     severity: clampSeverity(v.severity),
     original_severity: v.severity,
     title: `Vulnerable dependency: ${name}`,
@@ -157,9 +157,143 @@ function normalizeNpmAudit(report) {
     security_category: "Dependencies",
     package_name: name,
     package_version: v.range,
-    remediation: v.fixAvailable ? "Fix available — run npm audit fix" : "No automatic fix available yet",
+    remediation: v.fixAvailable ? "Fix available — run audit fix" : "No automatic fix available yet",
     metadata: {},
   }));
+  return { findings, status: findings.length ? "findings" : "passed" };
+}
+
+// ---- yarn audit (`yarn audit --json` emits newline-delimited JSON; each advisory line
+// has type "auditAdvisory") ----
+function normalizeYarnAudit(raw) {
+  if (typeof raw !== "string") return { findings: [], status: "passed" };
+  const findings = [];
+  for (const line of raw.split("\n")) {
+    if (!line.trim()) continue;
+    let obj;
+    try {
+      obj = JSON.parse(line);
+    } catch {
+      continue;
+    }
+    if (obj.type !== "auditAdvisory") continue;
+    const d = obj.data?.advisory;
+    if (!d) continue;
+    findings.push({
+      scanner: "yarn-audit",
+      external_finding_id: String(d.id),
+      fingerprint: fingerprint(["yarn-audit", d.module_name, d.id]),
+      severity: clampSeverity(d.severity),
+      original_severity: d.severity,
+      title: `Vulnerable dependency: ${d.module_name}`,
+      description: d.overview || d.title || "",
+      security_category: "Dependencies",
+      package_name: d.module_name,
+      package_version: d.vulnerable_versions,
+      remediation: d.patched_versions && d.patched_versions !== "<0.0.0" ? `Upgrade to ${d.patched_versions}` : "No automatic fix available yet",
+      metadata: { cwe: d.cwe, cves: d.cves },
+    });
+  }
+  return { findings, status: findings.length ? "findings" : "passed" };
+}
+
+// ---- pip-audit (`pip-audit -f json`: { dependencies: [{ name, version, vulns: [...] }] }) ----
+function normalizePipAudit(report) {
+  const deps = report?.dependencies;
+  if (!Array.isArray(deps)) return { findings: [], status: "passed" };
+  const findings = [];
+  for (const dep of deps) {
+    for (const v of dep.vulns || []) {
+      findings.push({
+        scanner: "pip-audit",
+        external_finding_id: v.id,
+        fingerprint: fingerprint(["pip-audit", dep.name, v.id]),
+        severity: "medium", // pip-audit (OSV-backed) doesn't emit a severity bucket directly
+        original_severity: null,
+        title: `Vulnerable dependency: ${dep.name} (${v.id})`,
+        description: v.description || "",
+        security_category: "Dependencies",
+        package_name: dep.name,
+        package_version: dep.version,
+        remediation: v.fix_versions?.length ? `Upgrade to ${v.fix_versions.join(" or ")}` : "No automatic fix available yet",
+        metadata: {},
+      });
+    }
+  }
+  return { findings, status: findings.length ? "findings" : "passed" };
+}
+
+// Dispatches the single `dependency-audit.json` artifact to the right normalizer based on
+// the `dependency-audit.manager` marker file the workflow writes alongside it. Falls back
+// to npm's shape (also what legacy `npm-audit.json` artifacts use) if the marker is missing.
+async function normalizeDependencyAudit(reportsDir, manager) {
+  const file = path.join(reportsDir, "dependency-audit.json");
+  if (manager === "yarn") {
+    const raw = await readFile(file, "utf8").catch(() => null);
+    return normalizeYarnAudit(raw);
+  }
+  const parsed = await readJsonIfExists(file);
+  if (manager === "pip-audit") return normalizePipAudit(parsed);
+  if (manager === "pnpm") return normalizeNpmAudit(parsed, "pnpm-audit");
+  return normalizeNpmAudit(parsed, "npm-audit");
+}
+
+// ---- Nuclei (`-jsonl` — one JSON object per line, one per matched template/host) ----
+function normalizeNuclei(raw) {
+  if (typeof raw !== "string") return { findings: [], status: "passed" };
+  const severityMap = { critical: "critical", high: "high", medium: "medium", low: "low", info: "informational", unknown: "informational" };
+  const findings = [];
+  for (const line of raw.split("\n")) {
+    if (!line.trim()) continue;
+    let r;
+    try {
+      r = JSON.parse(line);
+    } catch {
+      continue;
+    }
+    findings.push({
+      scanner: "nuclei",
+      external_finding_id: r["template-id"],
+      fingerprint: fingerprint(["nuclei", r["template-id"], r["matched-at"]]),
+      severity: severityMap[String(r.info?.severity || "").toLowerCase()] || "informational",
+      original_severity: r.info?.severity || null,
+      title: r.info?.name || r["template-id"],
+      description: r.info?.description || "Scanner evidence requiring manual triage — Nuclei matches are not automatic proof of exploitability.",
+      security_category: "Exposure/Misconfiguration",
+      endpoint: r["matched-at"],
+      evidence: (r["extracted-results"] || []).join(", ").slice(0, 500),
+      remediation: r.info?.remediation || null,
+      metadata: { tags: r.info?.tags || [], reference: r.info?.reference || [] },
+    });
+  }
+  return { findings, status: findings.length ? "findings" : "passed" };
+}
+
+// ---- Nmap (`-oX` XML output). No XML library dependency — the schema we need
+// (open ports on the single scanned host) is simple enough for a targeted regex walk. ----
+function normalizeNmap(raw, hostHint) {
+  if (typeof raw !== "string" || !raw.trim()) return { findings: [], status: "passed" };
+  const findings = [];
+  const portRe = /<port protocol="(\w+)" portid="(\d+)">\s*<state state="(\w+)"[^/]*\/>(?:\s*<service name="([^"]*)"[^/]*\/>)?/g;
+  let m;
+  while ((m = portRe.exec(raw))) {
+    const [, protocol, port, state, service] = m;
+    if (state !== "open") continue; // filtered/closed ports are not exposure findings
+    findings.push({
+      scanner: "nmap",
+      external_finding_id: `${protocol}/${port}`,
+      fingerprint: fingerprint(["nmap", hostHint, protocol, port]),
+      severity: "informational", // exposure evidence for triage, not a vulnerability by itself
+      original_severity: null,
+      title: `Open port ${port}/${protocol}${service ? ` (${service})` : ""} on ${hostHint || "target"}`,
+      description: "Externally reachable open port detected by a conservative top-100-ports discovery scan. Confirm this is expected (e.g. 443 for the app itself) — anything unexpected should be investigated.",
+      security_category: "Network Exposure",
+      endpoint: hostHint || null,
+      metadata: { protocol, port, service: service || null },
+    });
+  }
+  // Weekly-only, all-informational severity — status here is descriptive (did the scan surface
+  // ports to review), never a PR-blocking signal; the severity gate only runs in the PR workflow.
   return { findings, status: findings.length ? "findings" : "passed" };
 }
 
@@ -199,30 +333,63 @@ async function main() {
   const scannerResults = [];
   let allFindings = [];
 
+  // Trivy's Docker-image scan (only present when the repo has a Dockerfile) reuses the same
+  // normalizeTrivy shape but is a distinct scanner-result entry from the filesystem scan.
   const specs = [
-    { file: "gitleaks.json", name: "gitleaks", normalize: normalizeGitleaks },
-    { file: "semgrep.json", name: "semgrep", normalize: normalizeSemgrep },
-    { file: "trivy.json", name: "trivy", normalize: normalizeTrivy },
-    { file: "npm-audit.json", name: "npm-audit", normalize: normalizeNpmAudit },
-    { file: "supabase-check.json", name: "supabase", normalize: normalizeSupabase },
-    { file: "zap-baseline.json", name: "zap", normalize: normalizeZap },
+    { file: "gitleaks.json", name: "gitleaks", normalize: normalizeGitleaks, kind: "json" },
+    { file: "semgrep.json", name: "semgrep", normalize: normalizeSemgrep, kind: "json" },
+    { file: "trivy.json", name: "trivy", normalize: normalizeTrivy, kind: "json" },
+    { file: "trivy-image.json", name: "trivy-image", normalize: normalizeTrivy, kind: "json" },
+    { file: "npm-audit.json", name: "npm-audit", normalize: normalizeNpmAudit, kind: "json" },
+    { file: "supabase-check.json", name: "supabase", normalize: normalizeSupabase, kind: "json" },
+    { file: "zap-baseline.json", name: "zap", normalize: normalizeZap, kind: "json" },
   ];
 
   for (const spec of specs) {
     if (!files.includes(spec.file)) continue;
-    const raw = await readJsonIfExists(path.join(REPORTS_DIR, spec.file));
     const failedMarker = files.includes(`${spec.name}.failed`);
     if (failedMarker) {
       scannerResults.push({ scanner: spec.name, status: "failed", duration_ms: null });
       continue;
     }
-    const { findings, status } = normalize(spec, raw);
+    const raw = await readJsonIfExists(path.join(REPORTS_DIR, spec.file));
+    const { findings, status } = spec.normalize(raw);
     scannerResults.push({ scanner: spec.name, status });
     allFindings.push(...findings);
   }
 
-  function normalize(spec, raw) {
-    return spec.normalize(raw);
+  // dependency-audit.json needs its manager marker to pick the right normalizer (npm/pnpm
+  // share a shape; yarn is line-delimited; pip-audit is its own OSV-derived shape).
+  if (files.includes("dependency-audit.json")) {
+    const manager = (await readFile(path.join(REPORTS_DIR, "dependency-audit.manager"), "utf8").catch(() => "npm")).trim();
+    const scannerName = { npm: "npm-audit", pnpm: "pnpm-audit", yarn: "yarn-audit", "pip-audit": "pip-audit" }[manager] || "npm-audit";
+    if (files.includes(`${scannerName}.failed`)) {
+      scannerResults.push({ scanner: scannerName, status: "failed", duration_ms: null });
+    } else {
+      const { findings, status } = await normalizeDependencyAudit(REPORTS_DIR, manager);
+      scannerResults.push({ scanner: scannerName, status });
+      allFindings.push(...findings);
+    }
+  }
+
+  if (files.includes("nuclei.jsonl")) {
+    const raw = await readFile(path.join(REPORTS_DIR, "nuclei.jsonl"), "utf8").catch(() => "");
+    const { findings, status } = normalizeNuclei(raw);
+    scannerResults.push({ scanner: "nuclei", status });
+    allFindings.push(...findings);
+  }
+
+  if (files.includes("nmap.xml")) {
+    const raw = await readFile(path.join(REPORTS_DIR, "nmap.xml"), "utf8").catch(() => "");
+    let hostHint = null;
+    try {
+      hostHint = process.env.SCAN_URL ? new URL(process.env.SCAN_URL).hostname : null;
+    } catch {
+      hostHint = null;
+    }
+    const { findings, status } = normalizeNmap(raw, hostHint);
+    scannerResults.push({ scanner: "nmap", status });
+    allFindings.push(...findings);
   }
 
   const counts = { critical: 0, high: 0, medium: 0, low: 0, informational: 0 };

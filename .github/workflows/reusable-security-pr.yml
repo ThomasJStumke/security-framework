@@ -46,7 +46,7 @@ jobs:
     outputs:
       status: ${{ steps.summarize.outputs.status }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           fetch-depth: 2
       - name: Run Gitleaks (current working tree — history scan is weekly-only)
@@ -62,7 +62,7 @@ jobs:
           else
             echo "status=passed" >> "$GITHUB_OUTPUT"
           fi
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: security-gitleaks
           path: .security-reports/
@@ -77,7 +77,7 @@ jobs:
     container:
       image: semgrep/semgrep:1.78.0
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Run Semgrep
         run: |
           mkdir -p .security-reports
@@ -88,31 +88,32 @@ jobs:
             --json --output=.security-reports/semgrep.json \
             --error || true
         continue-on-error: true
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: security-semgrep
           path: .security-reports/semgrep.json
           retention-days: 30
 
   trivy:
-    name: Trivy (dependencies/config)
+    name: Trivy (dependencies/config/IaC)
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - run: mkdir -p .security-reports
-      - name: Run Trivy filesystem scan
-        uses: aquasecurity/trivy-action@v0.36.0
+      - name: Run Trivy filesystem scan (deps + secrets + config/IaC)
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         with:
           scan-type: fs
           scan-ref: .
+          scanners: "vuln,secret,misconfig"
           format: json
           output: .security-reports/trivy.json
           severity: "CRITICAL,HIGH,MEDIUM,LOW"
           exit-code: "0"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: security-trivy
           path: .security-reports/trivy.json
@@ -125,20 +126,44 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: ${{ inputs.node-version }}
-      - name: Generate lockfile for audit (no full install)
-        run: npm install --package-lock-only --ignore-scripts || true
-      - name: npm audit
+      - name: Detect package manager and run appropriate audit
         run: |
+          set +e
           mkdir -p .security-reports
-          npm audit --json --package-lock-only > .security-reports/npm-audit.json || true
-      - uses: actions/upload-artifact@v4
+          if [ -f pnpm-lock.yaml ]; then
+            echo "pnpm" > .security-reports/dependency-audit.manager
+            corepack enable
+            corepack prepare pnpm@latest --activate
+            pnpm audit --json > .security-reports/dependency-audit.json 2>/dev/null
+          elif [ -f yarn.lock ]; then
+            echo "yarn" > .security-reports/dependency-audit.manager
+            corepack enable
+            yarn audit --json > .security-reports/dependency-audit.json 2>/dev/null
+          elif [ -f requirements.txt ] || [ -f pyproject.toml ] || [ -f Pipfile ]; then
+            echo "pip-audit" > .security-reports/dependency-audit.manager
+            pip install --quiet pip-audit
+            if [ -f requirements.txt ]; then
+              pip-audit -r requirements.txt -f json -o .security-reports/dependency-audit.json
+            else
+              pip-audit -f json -o .security-reports/dependency-audit.json
+            fi
+          else
+            echo "npm" > .security-reports/dependency-audit.manager
+            npm install --package-lock-only --ignore-scripts
+            npm audit --json --package-lock-only > .security-reports/dependency-audit.json
+          fi
+          [ -s .security-reports/dependency-audit.json ] || echo '{}' > .security-reports/dependency-audit.json
+          exit 0
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: security-dependency-audit
-          path: .security-reports/npm-audit.json
+          path: |
+            .security-reports/dependency-audit.json
+            .security-reports/dependency-audit.manager
           retention-days: 30
 
   supabase-check:
@@ -149,16 +174,16 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           repository: ThomasJStumke/security-framework
           path: .security-framework
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: ${{ inputs.node-version }}
       - run: node .security-framework/scripts/supabase-check.mjs . .security-reports/supabase-check.json
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: security-supabase
           path: .security-reports/supabase-check.json
@@ -173,21 +198,21 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           repository: ThomasJStumke/security-framework
           path: .security-framework
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: ${{ inputs.node-version }}
       - name: Download all scanner artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           path: .security-reports-raw
       - name: Flatten artifacts into .security-reports
         run: |
           mkdir -p .security-reports
-          find .security-reports-raw -type f \( -name "*.json" -o -name "*.sarif" \) -exec cp {} .security-reports/ \;
+          find .security-reports-raw -type f \( -name "*.json" -o -name "*.sarif" -o -name "*.manager" \) -exec cp {} .security-reports/ \;
           ls -la .security-reports
       - name: Normalize and submit
         env:
@@ -205,7 +230,7 @@ jobs:
           GITHUB_RUN_ID: ${{ github.run_id }}
           GITHUB_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: node .security-framework/scripts/normalize-and-submit.mjs
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: security-normalized-summary
           path: .security-reports/normalized-payload.json

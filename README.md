@@ -6,11 +6,15 @@ personal GitHub account. One place to fix a scanner config instead of ~20.
 ## What lives here
 
 - `.github/workflows/reusable-security-pr.yml` — fast PR/push checks: Gitleaks (working
-  tree), Semgrep CE, Trivy, npm audit, optional Supabase static check. Fails the PR only
-  on findings at or above `fail-on-severity` (default `high`).
+  tree), Semgrep CE, Trivy (vuln+secret+misconfig/IaC), auto-detected dependency audit
+  (npm/pnpm/yarn/pip-audit), optional Supabase static check. Fails the PR only on
+  findings at or above `fail-on-severity` (default `high`).
 - `.github/workflows/reusable-security-weekly.yml` — deep weekly scan: full-history
-  Gitleaks, full Semgrep, Trivy, npm audit, Supabase static check, OWASP ZAP baseline
-  (only if a scan URL is configured), Nuclei (deferred — see below).
+  Gitleaks, full Semgrep, Trivy (vuln+secret+misconfig/IaC, plus a Docker image scan if
+  the repo has a Dockerfile), dependency audit, Supabase static check, OWASP ZAP baseline
+  and Nuclei (both only if `SECURITY_SCAN_URL` is configured for that repo), and Nmap
+  (opt-in per repo via `enable-nmap: true` — off by default since most apps here are
+  serverless behind Cloudflare/Vercel, where a port scan only reveals the edge network).
 - `scripts/normalize-and-submit.mjs` — turns every scanner's raw output into one common
   finding shape and POSTs it to Mission Control's `/api/security/scans`. Redacts secret
   values before they ever leave the runner.
@@ -88,13 +92,45 @@ bugs across this codebase's actual stack. Writing and maintaining ~20 repos' wor
 custom Semgrep rules would directly work against "low maintenance" — only add a custom
 rule here if a specific recurring false-negative shows up in practice.
 
-## Nuclei — deferred, not wired up
+## Nuclei
 
-Nuclei needs a vetted, non-destructive template subset and a real target list per app
-to avoid noisy/risky scanning of production endpoints, and none of that exists yet. The
-weekly reusable workflow has a placeholder job (`enable-nuclei: true`) that currently
-just prints a message — flip it on only after templates and targets are chosen. Source
-code and dependency scans do not depend on this and are fully live already.
+Runs in the weekly workflow whenever `SECURITY_SCAN_URL` is configured for a repo
+(same gate as ZAP). Template selection is restricted to explicitly non-destructive tags
+(`exposed-panels`, `exposure`, `misconfig`, `headers`, `ssl`, `tech`) with `dos`, `fuzz`,
+`intrusive`, and `takeover` excluded via `-etags`. Rate-limited (`-rl 20 -c 10`) to be a
+polite, low-volume scan. Findings are scanner evidence for triage, not proof of
+exploitability — see `docs/security-scoring.md`. Set `enable-nuclei: false` per-repo to
+opt out even when a scan URL exists.
+
+## Nmap
+
+Off by default (`enable-nmap: false`) — most apps here are serverless behind
+Cloudflare/Vercel, where a port scan only reveals Cloudflare's edge network, not the
+app itself, which would just manufacture noise. Opt in per-repo (`enable-nmap: true`)
+only for confirmed non-serverless/self-hosted infrastructure (e.g. a homelab box behind
+a Cloudflare Tunnel with its own exposed origin). When it runs: `nmap -Pn --top-ports
+100 -T3` against the hostname derived from `SECURITY_SCAN_URL` — no NSE scripts, no
+`-A`, no brute force. All findings are severity `informational` (exposure evidence for
+a human to confirm is expected, not a vulnerability by itself).
+
+## Dependency audit — package manager auto-detection
+
+The `dependency-audit` job picks the right tool per repo automatically, in this order:
+`pnpm-lock.yaml` → `pnpm audit`, `yarn.lock` → `yarn audit`, `requirements.txt` /
+`pyproject.toml` / `Pipfile` → `pip-audit`, otherwise `npm audit` (generating a
+throwaway `package-lock.json` via `--package-lock-only` — never committed, since the
+job never pushes). `normalize-and-submit.mjs` reads the `dependency-audit.manager`
+marker file the job writes to pick the matching normalizer.
+
+## GitHub Actions pinning
+
+`actions/checkout`, `actions/setup-node`, `actions/upload-artifact`,
+`actions/download-artifact`, `aquasecurity/trivy-action`, and `zaproxy/action-baseline`
+are pinned to the exact commit SHA behind their current version tag (with the tag kept
+as a trailing comment for readability). Gitleaks/Semgrep/Trivy/Nuclei run as Docker
+images pinned to an explicit version tag, which is the practical pinning granularity
+those already get. To bump a pinned action: resolve the new tag's SHA with
+`gh api repos/<owner>/<repo>/commits/<tag> --jq .sha` and update both files.
 
 ## Severity gate on PRs
 
