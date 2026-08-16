@@ -1,4 +1,8 @@
-name: Reusable Security Weekly Scan
+name: Reusable Security Daily Scan
+# Filename kept as reusable-security-weekly.yml to avoid rewriting every consuming
+# repo's `uses:` reference; the cadence is daily as of 2026-08-16 (per-repo cron in
+# each repo's own .github/workflows/security-weekly.yml wrapper -- this reusable
+# workflow itself has no schedule trigger of its own, only workflow_call).
 
 on:
   workflow_call:
@@ -44,8 +48,51 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  check-previous-scan:
+    name: Check previous scan (skip unchanged source scans)
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    outputs:
+      code-unchanged: ${{ steps.check.outputs.code-unchanged }}
+    steps:
+      - id: check
+        env:
+          MC_SECURITY_URL: ${{ inputs.mc-security-url }}
+          MC_APPLICATION_ID: ${{ inputs.application-id }}
+          COMMIT_SHA: ${{ github.sha }}
+        run: |
+          set +e
+          # Conservative by design: any failure/ambiguity here (MC unreachable, no
+          # prior scan, unexpected response shape) falls through to "false" (run
+          # everything) -- this check only ever SKIPS work, never security coverage,
+          # so the safe failure mode is "scan anyway", not "skip and hope".
+          echo "code-unchanged=false" >> "$GITHUB_OUTPUT"
+          if [ -z "$MC_SECURITY_URL" ]; then
+            echo "MC_SECURITY_URL not set — cannot check previous scan, running everything."
+            exit 0
+          fi
+          BASE_URL="${MC_SECURITY_URL%/api/security/scans}"
+          RESP=$(curl -sf --max-time 15 "${BASE_URL}/api/security/scans?applicationId=${MC_APPLICATION_ID}&limit=5")
+          [ -z "$RESP" ] && exit 0
+          LAST_SHA=$(node -e '
+            try {
+              const d = JSON.parse(process.argv[1] || "{}");
+              const items = d.items || [];
+              const last = items.find((i) => i.scanType === "daily" && i.status === "completed");
+              process.stdout.write(last && last.commitSha ? last.commitSha : "");
+            } catch { process.stdout.write(""); }
+          ' "$RESP")
+          if [ -n "$LAST_SHA" ] && [ "$LAST_SHA" = "$COMMIT_SHA" ]; then
+            echo "Previous successful daily scan already covered commit $COMMIT_SHA — skipping source/dependency re-scan."
+            echo "code-unchanged=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "No unchanged prior scan found for $COMMIT_SHA (last scanned: ${LAST_SHA:-none}) — running full suite."
+          fi
+
   gitleaks-history:
     name: Gitleaks (full git history)
+    needs: [check-previous-scan]
+    if: ${{ needs.check-previous-scan.outputs.code-unchanged != 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 20
     permissions:
@@ -68,6 +115,8 @@ jobs:
 
   semgrep:
     name: Semgrep CE (full SAST)
+    needs: [check-previous-scan]
+    if: ${{ needs.check-previous-scan.outputs.code-unchanged != 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 20
     permissions:
@@ -91,6 +140,8 @@ jobs:
 
   trivy:
     name: Trivy (dependencies/config/IaC/Docker)
+    needs: [check-previous-scan]
+    if: ${{ needs.check-previous-scan.outputs.code-unchanged != 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
@@ -126,6 +177,8 @@ jobs:
 
   dependency-audit:
     name: Dependency audit
+    needs: [check-previous-scan]
+    if: ${{ needs.check-previous-scan.outputs.code-unchanged != 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
@@ -173,7 +226,8 @@ jobs:
 
   supabase-check:
     name: Supabase/RLS static check
-    if: ${{ inputs.supabase-enabled }}
+    needs: [check-previous-scan]
+    if: ${{ inputs.supabase-enabled && needs.check-previous-scan.outputs.code-unchanged != 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
@@ -310,7 +364,7 @@ jobs:
 
   normalize-and-submit:
     name: Normalize + submit to Mission Control
-    needs: [gitleaks-history, semgrep, trivy, dependency-audit, supabase-check, zap-baseline, nuclei, nmap]
+    needs: [check-previous-scan, gitleaks-history, semgrep, trivy, dependency-audit, supabase-check, zap-baseline, nuclei, nmap]
     if: ${{ always() }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -338,9 +392,13 @@ jobs:
           MC_APPLICATION_ID: ${{ inputs.application-id }}
           MC_SECURITY_URL: ${{ inputs.mc-security-url }}
           MISSION_CONTROL_SECURITY_TOKEN: ${{ secrets.MISSION_CONTROL_SECURITY_TOKEN }}
-          SCAN_TYPE: weekly
+          SCAN_TYPE: daily
           SCAN_ENVIRONMENT: ${{ inputs.scan-url != '' && 'staging' || 'ci' }}
           SCAN_URL: ${{ inputs.scan-url }}
+          SUPABASE_ENABLED: ${{ inputs.supabase-enabled }}
+          ENABLE_NUCLEI: ${{ inputs.enable-nuclei }}
+          ENABLE_NMAP: ${{ inputs.enable-nmap }}
+          CODE_UNCHANGED: ${{ needs.check-previous-scan.outputs.code-unchanged }}
           SCAN_STARTED_AT: ${{ github.event.repository.updated_at }}
           COMMIT_SHA: ${{ github.sha }}
           BRANCH: ${{ github.ref_name }}

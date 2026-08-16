@@ -7,11 +7,18 @@
 //   MISSION_CONTROL_SECURITY_TOKEN
 //   MC_APPLICATION_ID           loose text id matching mc_repositories.application_id convention
 //   REPO_OWNER, REPO_NAME
-//   SCAN_TYPE                   pr | weekly | manual
+//   SCAN_TYPE                   pr | daily | weekly | manual
 //   SCAN_STARTED_AT             ISO timestamp
 //   COMMIT_SHA, BRANCH          (optional)
 //   GITHUB_RUN_ID, GITHUB_RUN_URL (optional)
 //   REPORTS_DIR                 directory containing raw scanner output (default: .security-reports)
+//   SUPABASE_ENABLED, SCAN_URL, ENABLE_NUCLEI, ENABLE_NMAP (optional)
+//     Used only to tell an *intentional* per-repo skip (Supabase check disabled, no
+//     SECURITY_SCAN_URL configured, Nuclei/Nmap opted out) apart from a scanner that
+//     was expected to run and didn't produce a report -- the latter becomes a
+//     "failed" scanner_results entry plus a synthetic missing-security-control
+//     finding, per the "security problem -> Mission Control finding, security
+//     automation problem -> visible/flagged, never silently fewer findings" rule.
 //
 // Never sends raw secret values — Gitleaks matches/secrets are redacted before normalization.
 
@@ -358,28 +365,68 @@ function normalizeZap(report) {
   return { findings, status: findings.length ? "findings" : "passed" };
 }
 
+// A scanner/control expected to have produced a report but didn't (job crashed,
+// tool failed to install, timed out, etc.) becomes both a "failed" scanner_results
+// entry AND a real, deduplicated Mission Control finding -- so it's visible next to
+// actual vulnerabilities instead of just silently reducing the finding count.
+function missingControlFinding(scannerName, appId) {
+  return {
+    fingerprint: fingerprint(["missing-control", appId, scannerName]),
+    scanner: "security-framework",
+    severity: "high",
+    title: `Security control missing or failed to execute: ${scannerName}`,
+    description: `The ${scannerName} scanner was expected to run in this scan but produced no report. This means a security control gap, not zero findings -- normalize-and-submit.mjs found the scanner enabled/expected but its report file was absent from the uploaded artifacts.`,
+    remediation: `Inspect the "${scannerName}" job in the most recent security-framework run for this repo (install failure, timeout, Docker/registry issue, or a workflow-config problem) and re-run once fixed.`,
+    security_category: "Infrastructure",
+    metadata: { kind: "missing-control", scanner: scannerName },
+  };
+}
+
 async function main() {
   const files = await readdir(REPORTS_DIR).catch(() => []);
   const scannerResults = [];
   let allFindings = [];
+  const appId = process.env.MC_APPLICATION_ID || process.env.REPO_NAME || "unknown";
+  const scanUrlConfigured = Boolean(process.env.SCAN_URL);
+  const supabaseEnabled = process.env.SUPABASE_ENABLED === "true";
+  const nucleiEnabled = process.env.ENABLE_NUCLEI !== "false"; // reusable workflow defaults to true
+  const nmapEnabled = process.env.ENABLE_NMAP === "true"; // reusable workflow defaults to false
+  const codeUnchanged = process.env.CODE_UNCHANGED === "true"; // source/dependency scanners were deliberately skipped this run
+
+  function recordMissing(scannerName) {
+    scannerResults.push({ scanner: scannerName, status: "failed", duration_ms: null });
+    allFindings.push(missingControlFinding(scannerName, appId));
+  }
 
   // Trivy's Docker-image scan (only present when the repo has a Dockerfile) reuses the same
-  // normalizeTrivy shape but is a distinct scanner-result entry from the filesystem scan.
+  // normalizeTrivy shape but is a distinct scanner-result entry from the filesystem scan, and
+  // is legitimately absent for repos with no Dockerfile -- excluded from missing-control checks.
   const specs = [
-    { file: "gitleaks.json", name: "gitleaks", normalize: normalizeGitleaks, kind: "json" },
-    { file: "semgrep.json", name: "semgrep", normalize: normalizeSemgrep, kind: "json" },
-    { file: "trivy.json", name: "trivy", normalize: normalizeTrivy, kind: "json" },
-    { file: "trivy-image.json", name: "trivy-image", normalize: normalizeTrivy, kind: "json" },
-    { file: "npm-audit.json", name: "npm-audit", normalize: normalizeNpmAudit, kind: "json" },
-    { file: "supabase-check.json", name: "supabase", normalize: normalizeSupabase, kind: "json" },
-    { file: "zap-baseline.json", name: "zap", normalize: normalizeZap, kind: "json" },
+    { file: "gitleaks.json", name: "gitleaks", normalize: normalizeGitleaks, alwaysExpected: true, skippable: true },
+    { file: "semgrep.json", name: "semgrep", normalize: normalizeSemgrep, alwaysExpected: true, skippable: true },
+    { file: "trivy.json", name: "trivy", normalize: normalizeTrivy, alwaysExpected: true, skippable: true },
+    { file: "trivy-image.json", name: "trivy-image", normalize: normalizeTrivy, alwaysExpected: false, skippable: true },
+    { file: "npm-audit.json", name: "npm-audit", normalize: normalizeNpmAudit, alwaysExpected: false, skippable: true },
+    { file: "supabase-check.json", name: "supabase", normalize: normalizeSupabase, alwaysExpected: false, expectedIf: () => supabaseEnabled, skippable: true },
+    { file: "zap-baseline.json", name: "zap", normalize: normalizeZap, alwaysExpected: false, expectedIf: () => scanUrlConfigured },
   ];
 
   for (const spec of specs) {
-    if (!files.includes(spec.file)) continue;
     const failedMarker = files.includes(`${spec.name}.failed`);
     if (failedMarker) {
-      scannerResults.push({ scanner: spec.name, status: "failed", duration_ms: null });
+      recordMissing(spec.name);
+      continue;
+    }
+    if (!files.includes(spec.file)) {
+      // Deliberately skipped because a prior successful daily scan already covered
+      // this exact commit (see check-previous-scan) -- not a missing-control gap.
+      // Existing findings from this scanner simply aren't resubmitted; the ingest
+      // endpoint only upserts what's present in a payload, it never deletes/closes
+      // findings absent from one, so their state (open/fixed/accepted_risk/etc) is
+      // untouched rather than duplicated or wiped.
+      if (spec.skippable && codeUnchanged) continue;
+      const expected = spec.alwaysExpected || (spec.expectedIf && spec.expectedIf());
+      if (expected) recordMissing(spec.name);
       continue;
     }
     const raw = await readJsonIfExists(path.join(REPORTS_DIR, spec.file));
@@ -389,17 +436,20 @@ async function main() {
   }
 
   // dependency-audit.json needs its manager marker to pick the right normalizer (npm/pnpm
-  // share a shape; yarn is line-delimited; pip-audit is its own OSV-derived shape).
+  // share a shape; yarn is line-delimited; pip-audit is its own OSV-derived shape). Always
+  // expected -- every repo in this fleet has a lockfile of some kind.
   if (files.includes("dependency-audit.json")) {
     const manager = (await readFile(path.join(REPORTS_DIR, "dependency-audit.manager"), "utf8").catch(() => "npm")).trim();
     const scannerName = { npm: "npm-audit", pnpm: "pnpm-audit", yarn: "yarn-audit", "pip-audit": "pip-audit" }[manager] || "npm-audit";
     if (files.includes(`${scannerName}.failed`)) {
-      scannerResults.push({ scanner: scannerName, status: "failed", duration_ms: null });
+      recordMissing(scannerName);
     } else {
       const { findings, status } = await normalizeDependencyAudit(REPORTS_DIR, manager);
       scannerResults.push({ scanner: scannerName, status });
       allFindings.push(...findings);
     }
+  } else if (!codeUnchanged) {
+    recordMissing("dependency-audit");
   }
 
   if (files.includes("nuclei.jsonl")) {
@@ -407,6 +457,8 @@ async function main() {
     const { findings, status } = normalizeNuclei(raw);
     scannerResults.push({ scanner: "nuclei", status });
     allFindings.push(...findings);
+  } else if (scanUrlConfigured && nucleiEnabled) {
+    recordMissing("nuclei");
   }
 
   if (files.includes("nmap.xml")) {
@@ -420,6 +472,8 @@ async function main() {
     const { findings, status } = normalizeNmap(raw, hostHint);
     scannerResults.push({ scanner: "nmap", status });
     allFindings.push(...findings);
+  } else if (scanUrlConfigured && nmapEnabled) {
+    recordMissing("nmap");
   }
 
   const counts = { critical: 0, high: 0, medium: 0, low: 0, informational: 0 };
