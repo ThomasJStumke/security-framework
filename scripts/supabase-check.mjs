@@ -195,8 +195,24 @@ async function main() {
   // in mock SQL/descriptions when testing that a bypass is blocked) and known framework
   // server-entry filenames that don't follow the *.server.ts convention but are never
   // bundled client-side either (e.g. TanStack Start's src/server.ts SSR bootstrap).
+  //
+  // Also excludes TanStack Start API route files (src/routes/api/**) whose entire route
+  // export is wrapped in the framework's own `server: { handlers: {...} } }` boundary —
+  // this is a provable, framework/runtime-enforced server-only split (the router-plugin
+  // compiles `server.handlers` code into server-only output; it never reaches the client
+  // bundle, the same guarantee *.server.ts gets from its filename), verified empirically
+  // for this exact repo pattern by grepping .output/public/**/*.js and finding zero trace
+  // of such a route's imports/identifiers post-build. This is intentionally narrow: it
+  // only exempts files matching this specific structural shape (createFileRoute(...) whose
+  // top-level config contains a `server: { handlers: {` block covering the whole export),
+  // not "anything under routes/api" — a file under that path without the wrapper, or with
+  // service-role-referencing code outside it, is still flagged normally.
   const FRAMEWORK_SERVER_ENTRY_PATHS = new Set(["src/server.ts", "src/server.tsx", "src/start.ts", "src/start.tsx"]);
   const isTestFile = (relPath) => /\.(test|spec)\.[jt]sx?$/.test(relPath) || /(^|\/)__tests__\//.test(relPath);
+  const isTanStackServerRoute = (relPath, content) =>
+    /^src\/routes\/api\//.test(relPath) &&
+    /createFileRoute\(/.test(content) &&
+    /server:\s*\{\s*handlers:\s*\{/.test(content);
   const srcDir = path.join(repoRoot, "src");
   const clientFiles = await walk(
     srcDir,
@@ -206,6 +222,7 @@ async function main() {
     const rel = path.relative(repoRoot, file).replace(/\\/g, "/");
     if (isTestFile(rel) || FRAMEWORK_SERVER_ENTRY_PATHS.has(rel)) continue;
     const content = await readFile(file, "utf8").catch(() => "");
+    if (isTanStackServerRoute(rel, content)) continue;
     if (/service_role/i.test(content) || /SUPABASE_SERVICE_ROLE_KEY/.test(content)) {
       findings.push({
         scanner: "supabase-check",

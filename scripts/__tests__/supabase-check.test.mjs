@@ -113,5 +113,21 @@ test("service_role reference in a *.test.ts file is NOT flagged (test files neve
   assert.equal(falsePositive.length, 0);
 });
 
+test("service_role reference in a TanStack Start server-route file (createFileRoute + server.handlers) is NOT flagged", () => {
+  // Regression fixture for Mission Control's src/routes/api/security/events.ts
+  // false positive (2026-08-16): a real server-only API route, not .server.ts-suffixed,
+  // whose service_role text is a denylist regex literal, not a credential reference.
+  const findings = run("service-role-leak");
+  const falsePositive = findingsMatching(findings, (f) => f.file_path?.includes("routes/api/events.ts"));
+  assert.equal(falsePositive.length, 0, `expected no finding for the server-route pattern, got: ${JSON.stringify(falsePositive)}`);
+});
+
+test("service_role reference under src/routes/api/ but OUTSIDE a server.handlers boundary is STILL flagged (exemption is structural, not path-based)", () => {
+  const findings = run("service-role-leak");
+  const leak = findingsMatching(findings, (f) => f.file_path?.includes("leaky-not-wrapped.ts"));
+  assert.equal(leak.length, 1, `expected the unwrapped leak to still be caught, got: ${JSON.stringify(findings.map((f) => f.file_path))}`);
+  assert.equal(leak[0].severity, "critical");
+});
+
 console.log(`\n${passed} passed, ${failed} failed`);
 if (failed > 0) process.exit(1);
