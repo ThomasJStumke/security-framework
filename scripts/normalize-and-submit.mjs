@@ -318,7 +318,19 @@ function normalizeZap(report) {
   if (scanUrl) {
     try {
       const targetHost = new URL(scanUrl).hostname;
-      targetSite = sites.find((s) => s["@host"] === targetHost || s["@name"]?.includes(targetHost)) || targetSite;
+      // Exact hostname match only. A substring/`.includes()` check on `@name` is unsafe here --
+      // e.g. targetHost "daretofish.com" is a substring of "cdn.daretofish.com", so a subdomain
+      // entry earlier in the array would falsely win over the real (exact) match.
+      targetSite =
+        sites.find((s) => s["@host"] === targetHost) ??
+        sites.find((s) => {
+          try {
+            return new URL(s["@name"]).hostname === targetHost;
+          } catch {
+            return false;
+          }
+        }) ??
+        targetSite;
     } catch {
       // malformed SCAN_URL -- fall back to site[0] below rather than throwing
     }
