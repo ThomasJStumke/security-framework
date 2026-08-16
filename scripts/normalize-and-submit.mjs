@@ -304,8 +304,26 @@ function normalizeSupabase(report) {
 }
 
 // ---- ZAP baseline ----
+// ZAP's baseline spider follows every same- and cross-origin resource the page loads (fonts,
+// analytics, OAuth providers, Supabase, etc), so `report.site` is an array of ALL of those
+// hosts, each with their own (usually empty) `alerts` -- not just the scanned target. The
+// target's own entry can land at any index. Match it by hostname against SCAN_URL rather than
+// assuming site[0]; falling back to site[0] silently reported an unrelated third-party host's
+// (typically clean) results as if they were the target's own scan.
 function normalizeZap(report) {
-  const alerts = report?.site?.[0]?.alerts;
+  const sites = report?.site;
+  if (!Array.isArray(sites) || sites.length === 0) return { findings: [], status: "passed" };
+  let targetSite = sites[0];
+  const scanUrl = process.env.SCAN_URL;
+  if (scanUrl) {
+    try {
+      const targetHost = new URL(scanUrl).hostname;
+      targetSite = sites.find((s) => s["@host"] === targetHost || s["@name"]?.includes(targetHost)) || targetSite;
+    } catch {
+      // malformed SCAN_URL -- fall back to site[0] below rather than throwing
+    }
+  }
+  const alerts = targetSite?.alerts;
   if (!Array.isArray(alerts)) return { findings: [], status: "passed" };
   const riskMap = { 3: "high", 2: "medium", 1: "low", 0: "informational" };
   const findings = alerts.map((a) => ({
