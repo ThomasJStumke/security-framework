@@ -209,6 +209,14 @@ jobs:
           target: ${{ inputs.scan-url }}
           cmd_options: "-a -j"
           fail_action: false
+          # This action defaults to filing a GitHub issue with the report whenever
+          # any alert is present. The job only has `contents: read`, so that POST
+          # always 403'd and failed the whole job even though the scan itself
+          # succeeded (WARN-level passive findings are expected/normal). Findings
+          # already reach Mission Control via normalize-and-submit below, so the
+          # GitHub-issue path is redundant — disable it rather than widening
+          # permissions to `issues: write` just to let it succeed.
+          allow_issue_writing: false
           artifact_name: security-zap
       - run: |
           mkdir -p .security-reports
