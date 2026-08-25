@@ -76,6 +76,12 @@ jobs:
       contents: read
     container:
       image: semgrep/semgrep:1.78.0
+      # Self-hosted runners reuse the same on-disk workspace across jobs in a
+      # run (unlike ubuntu-latest's fresh VM per job) -- a container running
+      # as root (the image default) leaves root-owned files that break the
+      # NEXT job's checkout cleanup with EACCES. Run as the runner's own uid
+      # instead so nothing it writes needs a privileged cleanup.
+      options: --user 1000:1000
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Run Semgrep
