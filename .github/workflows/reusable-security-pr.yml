@@ -39,7 +39,7 @@ concurrency:
 jobs:
   gitleaks:
     name: Gitleaks (secrets)
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, homelab]
     timeout-minutes: 10
     permissions:
       contents: read
@@ -70,7 +70,7 @@ jobs:
 
   semgrep:
     name: Semgrep CE (SAST)
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, homelab]
     timeout-minutes: 15
     permissions:
       contents: read
@@ -96,7 +96,7 @@ jobs:
 
   trivy:
     name: Trivy (dependencies/config/IaC)
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, homelab]
     timeout-minutes: 10
     permissions:
       contents: read
@@ -121,7 +121,7 @@ jobs:
 
   dependency-audit:
     name: Dependency audit
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, homelab]
     timeout-minutes: 10
     permissions:
       contents: read
@@ -169,7 +169,7 @@ jobs:
   supabase-check:
     name: Supabase/RLS static check
     if: ${{ inputs.supabase-enabled }}
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, homelab]
     timeout-minutes: 5
     permissions:
       contents: read
@@ -193,7 +193,7 @@ jobs:
     name: Normalize + submit to Mission Control
     needs: [gitleaks, semgrep, trivy, dependency-audit, supabase-check]
     if: ${{ always() }}
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, homelab]
     timeout-minutes: 10
     permissions:
       contents: read
