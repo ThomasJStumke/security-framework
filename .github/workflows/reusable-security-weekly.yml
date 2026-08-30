@@ -103,7 +103,7 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
       - name: Run Gitleaks against full history
@@ -112,7 +112,7 @@ jobs:
           docker run --rm -v "$PWD:/repo" zricethezav/gitleaks:v8.18.4 detect \
             --source=/repo --report-format=json --report-path=/repo/.security-reports/gitleaks.json --exit-code=0 || true
         continue-on-error: true
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: security-gitleaks
           path: .security-reports/gitleaks.json
@@ -135,7 +135,7 @@ jobs:
       # self-hosted; harmless no-op string on ubuntu-latest since it never opts in.
       options: ${{ contains(inputs.runner-labels, 'self-hosted') && '--user 1000:1000' || '' }}
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - run: |
           mkdir -p .security-reports
           semgrep scan \
@@ -143,7 +143,7 @@ jobs:
             --config p/typescript --config p/react \
             --json --output=.security-reports/semgrep.json --error || true
         continue-on-error: true
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: security-semgrep
           path: .security-reports/semgrep.json
@@ -158,7 +158,7 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - run: mkdir -p .security-reports
       - uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         with:
@@ -177,7 +177,7 @@ jobs:
           docker run --rm -v "$PWD/.security-reports:/out" -v /var/run/docker.sock:/var/run/docker.sock \
             aquasec/trivy:latest image --format json --output /out/trivy-image.json --severity CRITICAL,HIGH,MEDIUM,LOW --exit-code 0 security-scan-target:local || true
         continue-on-error: true
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: security-trivy
           path: |
@@ -195,8 +195,8 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: ${{ inputs.node-version }}
       - name: Detect package manager and run appropriate audit
@@ -227,7 +227,7 @@ jobs:
           fi
           [ -s .security-reports/dependency-audit.json ] || echo '{}' > .security-reports/dependency-audit.json
           exit 0
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: security-dependency-audit
           path: |
@@ -244,16 +244,16 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: ThomasJStumke/security-framework
           path: .security-framework
-      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: ${{ inputs.node-version }}
       - run: node .security-framework/scripts/supabase-check.mjs . .security-reports/supabase-check.json
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: security-supabase
           path: .security-reports/supabase-check.json
@@ -267,7 +267,7 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: ZAP Baseline Scan (passive only — no active/attack rules)
         uses: zaproxy/action-baseline@de8ad967d3548d44ef623df22cf95c3b0baf8b25 # v0.15.0
         with:
@@ -286,7 +286,7 @@ jobs:
       - run: |
           mkdir -p .security-reports
           [ -f report_json.json ] && cp report_json.json .security-reports/zap-baseline.json || true
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: security-zap-normalized
           path: .security-reports/zap-baseline.json
@@ -301,7 +301,7 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Run Nuclei against confirmed app URL only
         run: |
           mkdir -p .security-reports
@@ -322,7 +322,7 @@ jobs:
             -no-interactsh \
             -silent || true
         continue-on-error: true
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: security-nuclei
           path: .security-reports/nuclei.jsonl
@@ -358,7 +358,7 @@ jobs:
         env:
           SCAN_URL: ${{ inputs.scan-url }}
         continue-on-error: true
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: security-nmap
           path: .security-reports/nmap.xml
@@ -382,14 +382,14 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: ThomasJStumke/security-framework
           path: .security-framework
-      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: ${{ inputs.node-version }}
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           path: .security-reports-raw
       - run: |
@@ -416,7 +416,7 @@ jobs:
           GITHUB_RUN_ID: ${{ github.run_id }}
           GITHUB_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: node .security-framework/scripts/normalize-and-submit.mjs
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: security-normalized-summary
           path: .security-reports/normalized-payload.json
