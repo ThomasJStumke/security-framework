@@ -36,6 +36,11 @@ on:
         required: false
         type: string
         default: ""
+      runner-labels:
+        description: "JSON array (as string) of runner labels, e.g. '[\"self-hosted\",\"homelab\"]'. Defaults to GitHub-hosted so repos without a homelab runner registered yet are unaffected."
+        required: false
+        type: string
+        default: '["ubuntu-latest"]'
     secrets:
       MISSION_CONTROL_SECURITY_TOKEN:
         required: false
@@ -50,7 +55,7 @@ concurrency:
 jobs:
   check-previous-scan:
     name: Check previous scan (skip unchanged source scans)
-    runs-on: ubuntu-latest
+    runs-on: ${{ fromJSON(inputs.runner-labels) }}
     timeout-minutes: 3
     outputs:
       code-unchanged: ${{ steps.check.outputs.code-unchanged }}
@@ -93,7 +98,7 @@ jobs:
     name: Gitleaks (full git history)
     needs: [check-previous-scan]
     if: ${{ needs.check-previous-scan.outputs.code-unchanged != 'true' }}
-    runs-on: ubuntu-latest
+    runs-on: ${{ fromJSON(inputs.runner-labels) }}
     timeout-minutes: 20
     permissions:
       contents: read
@@ -117,12 +122,18 @@ jobs:
     name: Semgrep CE (full SAST)
     needs: [check-previous-scan]
     if: ${{ needs.check-previous-scan.outputs.code-unchanged != 'true' }}
-    runs-on: ubuntu-latest
+    runs-on: ${{ fromJSON(inputs.runner-labels) }}
     timeout-minutes: 20
     permissions:
       contents: read
     container:
       image: semgrep/semgrep:1.78.0
+      # Self-hosted runners reuse the same on-disk workspace across jobs in a run
+      # (unlike ubuntu-latest's fresh VM per job) -- a container running as root
+      # (the image default) leaves root-owned files that break the next job's
+      # checkout cleanup with EACCES. Run as the homelab runner's own uid when
+      # self-hosted; harmless no-op string on ubuntu-latest since it never opts in.
+      options: ${{ contains(inputs.runner-labels, 'self-hosted') && '--user 1000:1000' || '' }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - run: |
@@ -142,7 +153,7 @@ jobs:
     name: Trivy (dependencies/config/IaC/Docker)
     needs: [check-previous-scan]
     if: ${{ needs.check-previous-scan.outputs.code-unchanged != 'true' }}
-    runs-on: ubuntu-latest
+    runs-on: ${{ fromJSON(inputs.runner-labels) }}
     timeout-minutes: 15
     permissions:
       contents: read
@@ -179,7 +190,7 @@ jobs:
     name: Dependency audit
     needs: [check-previous-scan]
     if: ${{ needs.check-previous-scan.outputs.code-unchanged != 'true' }}
-    runs-on: ubuntu-latest
+    runs-on: ${{ fromJSON(inputs.runner-labels) }}
     timeout-minutes: 10
     permissions:
       contents: read
@@ -228,7 +239,7 @@ jobs:
     name: Supabase/RLS static check
     needs: [check-previous-scan]
     if: ${{ inputs.supabase-enabled && needs.check-previous-scan.outputs.code-unchanged != 'true' }}
-    runs-on: ubuntu-latest
+    runs-on: ${{ fromJSON(inputs.runner-labels) }}
     timeout-minutes: 5
     permissions:
       contents: read
@@ -251,7 +262,7 @@ jobs:
   zap-baseline:
     name: OWASP ZAP baseline
     if: ${{ inputs.scan-url != '' }}
-    runs-on: ubuntu-latest
+    runs-on: ${{ fromJSON(inputs.runner-labels) }}
     timeout-minutes: 20
     permissions:
       contents: read
@@ -285,7 +296,7 @@ jobs:
   nuclei:
     name: Nuclei (safe, non-destructive templates)
     if: ${{ inputs.scan-url != '' && inputs.enable-nuclei }}
-    runs-on: ubuntu-latest
+    runs-on: ${{ fromJSON(inputs.runner-labels) }}
     timeout-minutes: 20
     permissions:
       contents: read
@@ -321,14 +332,14 @@ jobs:
   nuclei-not-configured:
     name: Nuclei (skipped — no scan-url)
     if: ${{ inputs.scan-url == '' || !inputs.enable-nuclei }}
-    runs-on: ubuntu-latest
+    runs-on: ${{ fromJSON(inputs.runner-labels) }}
     steps:
       - run: echo "Nuclei skipped — no SECURITY_SCAN_URL configured for this repo, or enable-nuclei is false. Source-code/dependency scans above are unaffected."
 
   nmap:
     name: Nmap (conservative exposure check)
     if: ${{ inputs.scan-url != '' && inputs.enable-nmap }}
-    runs-on: ubuntu-latest
+    runs-on: ${{ fromJSON(inputs.runner-labels) }}
     timeout-minutes: 10
     permissions:
       contents: read
@@ -357,7 +368,7 @@ jobs:
   nmap-not-applicable:
     name: Nmap (not applicable — no scan-url / serverless target)
     if: ${{ inputs.scan-url == '' || !inputs.enable-nmap }}
-    runs-on: ubuntu-latest
+    runs-on: ${{ fromJSON(inputs.runner-labels) }}
     steps:
       - run: |
           echo 'Nmap N/A -- no SECURITY_SCAN_URL configured, or enable-nmap is false (the default). Most apps here are serverless behind Cloudflare/Vercel, where a port scan only reveals the edge network, not the app, so this is off by default. Set enable-nmap: true per-repo only for confirmed non-serverless/self-hosted infrastructure.'
@@ -366,7 +377,7 @@ jobs:
     name: Normalize + submit to Mission Control
     needs: [check-previous-scan, gitleaks-history, semgrep, trivy, dependency-audit, supabase-check, zap-baseline, nuclei, nmap]
     if: ${{ always() }}
-    runs-on: ubuntu-latest
+    runs-on: ${{ fromJSON(inputs.runner-labels) }}
     timeout-minutes: 10
     permissions:
       contents: read
