@@ -170,6 +170,33 @@ function normalizeNpmAudit(report, scanner = "npm-audit") {
   return { findings, status: findings.length ? "findings" : "passed" };
 }
 
+// ---- bun audit (`bun audit --json`: { [pkgName]: [{ id, url, title, severity,
+// vulnerable_versions, cwe, cvss }] } -- NOT npm's { vulnerabilities: {...} } shape;
+// each package name maps directly to an array of advisories) ----
+function normalizeBunAudit(report) {
+  if (!report || typeof report !== "object") return { findings: [], status: "passed" };
+  const findings = [];
+  for (const [name, advisories] of Object.entries(report)) {
+    for (const a of advisories || []) {
+      findings.push({
+        scanner: "bun-audit",
+        external_finding_id: String(a.id),
+        fingerprint: fingerprint(["bun-audit", name, a.id]),
+        severity: clampSeverity(a.severity),
+        original_severity: a.severity,
+        title: a.title || `Vulnerable dependency: ${name}`,
+        description: a.title || "",
+        security_category: "Dependencies",
+        package_name: name,
+        package_version: a.vulnerable_versions,
+        remediation: "See advisory for a fixed version",
+        metadata: { cwe: a.cwe, cvss: a.cvss, url: a.url },
+      });
+    }
+  }
+  return { findings, status: findings.length ? "findings" : "passed" };
+}
+
 // ---- yarn audit (`yarn audit --json` emits newline-delimited JSON; each advisory line
 // has type "auditAdvisory") ----
 function normalizeYarnAudit(raw) {
@@ -242,6 +269,7 @@ async function normalizeDependencyAudit(reportsDir, manager) {
   const parsed = await readJsonIfExists(file);
   if (manager === "pip-audit") return normalizePipAudit(parsed);
   if (manager === "pnpm") return normalizeNpmAudit(parsed, "pnpm-audit");
+  if (manager === "bun") return normalizeBunAudit(parsed);
   return normalizeNpmAudit(parsed, "npm-audit");
 }
 
@@ -440,7 +468,7 @@ async function main() {
   // expected -- every repo in this fleet has a lockfile of some kind.
   if (files.includes("dependency-audit.json")) {
     const manager = (await readFile(path.join(REPORTS_DIR, "dependency-audit.manager"), "utf8").catch(() => "npm")).trim();
-    const scannerName = { npm: "npm-audit", pnpm: "pnpm-audit", yarn: "yarn-audit", "pip-audit": "pip-audit" }[manager] || "npm-audit";
+    const scannerName = { npm: "npm-audit", pnpm: "pnpm-audit", yarn: "yarn-audit", bun: "bun-audit", "pip-audit": "pip-audit" }[manager] || "npm-audit";
     if (files.includes(`${scannerName}.failed`)) {
       recordMissing(scannerName);
     } else {

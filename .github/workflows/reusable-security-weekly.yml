@@ -203,7 +203,19 @@ jobs:
         run: |
           set +e
           mkdir -p .security-reports
-          if [ -f pnpm-lock.yaml ]; then
+          if [ -f bun.lock ] || [ -f bun.lockb ]; then
+            # The actual package manager for nearly every consuming repo --
+            # checked first since several of them also carry a stray
+            # package-lock.json alongside bun.lock, which would otherwise
+            # false-match the npm fallback below and audit a lockfile that
+            # was never the one actually resolved/installed from.
+            echo "bun" > .security-reports/dependency-audit.manager
+            if ! command -v bun >/dev/null 2>&1; then
+              curl -fsSL https://bun.sh/install | bash
+              export PATH="$HOME/.bun/bin:$PATH"
+            fi
+            bun audit --json > .security-reports/dependency-audit.json 2>/dev/null
+          elif [ -f pnpm-lock.yaml ]; then
             echo "pnpm" > .security-reports/dependency-audit.manager
             corepack enable
             corepack prepare pnpm@latest --activate
