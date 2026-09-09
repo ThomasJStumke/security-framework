@@ -1,0 +1,25 @@
+name: Performance (Daily)
+
+# Copy to .github/workflows/performance-daily.yml in a consuming repo.
+# Replace __APPLICATION_ID__ and __TARGET_URL__ (or set vars.PERFORMANCE_TARGET_URL).
+# Stagger __CRON__ per repo so the ~20 repos don't all hit Mission Control at once
+# (early-morning UTC, offset from the 19:00 UTC security run).
+
+on:
+  schedule:
+    - cron: "__CRON__"
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  performance:
+    uses: ThomasJStumke/security-framework/.github/workflows/reusable-performance.yml@main
+    with:
+      runner-labels: '["self-hosted","homelab"]'
+      application-id: __APPLICATION_ID__
+      target-url: ${{ vars.PERFORMANCE_TARGET_URL }}
+      mc-performance-url: ${{ vars.MC_PERFORMANCE_URL }}
+    secrets:
+      MISSION_CONTROL_SECURITY_TOKEN: ${{ secrets.MISSION_CONTROL_SECURITY_TOKEN }}
