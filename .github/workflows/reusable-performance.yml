@@ -93,6 +93,30 @@ jobs:
           fi
         continue-on-error: true
 
+      # Lighthouse needs a Chrome binary. Self-hosted runners usually have none (every run was reported
+      # "partial" with "CHROME_PATH environment variable must be set"), so fall back to Playwright's
+      # Chromium, installed per-user (no sudo) and reused from the browser cache on later runs.
+      - name: Locate Chrome for Lighthouse
+        if: ${{ inputs.target-url != '' }}
+        run: |
+          if [ -z "$CHROME_PATH" ] && ! command -v google-chrome >/dev/null 2>&1 \
+             && ! command -v chromium >/dev/null 2>&1 && ! command -v chromium-browser >/dev/null 2>&1; then
+            CACHE="${PLAYWRIGHT_BROWSERS_PATH:-$HOME/.cache/ms-playwright}"
+            find_chrome() { ls -d "$CACHE"/chromium-*/chrome-linux*/chrome 2>/dev/null | sort -V | tail -1; }
+            CHROME="$(find_chrome)"
+            if [ -z "$CHROME" ]; then
+              npx --yes playwright install chromium || true
+              CHROME="$(find_chrome)"
+            fi
+            if [ -n "$CHROME" ]; then
+              echo "CHROME_PATH=$CHROME" >> "$GITHUB_ENV"
+              echo "Using Chromium at $CHROME"
+            else
+              echo "No Chrome available -- Lighthouse will be reported as partial."
+            fi
+          fi
+        continue-on-error: true
+
       - name: Lighthouse CI
         if: ${{ inputs.target-url != '' }}
         run: |
@@ -113,7 +137,12 @@ jobs:
                 | node -e 'let d="";process.stdin.on("data",c=>d+=c).on("end",()=>{try{const j=JSON.parse(d);const b=(j.data?.items?.[0]??j.items?.[0]);if(b?.bundleBytesGzip)process.stdout.write(JSON.stringify([{size:b.bundleBytesGzip}]))}catch{}})' \
                 > .perf-reports/size-limit.prev.json || true
             fi
-            npx --yes size-limit --json > .perf-reports/size-limit.json 2>/dev/null || echo "[]" > .perf-reports/size-limit.json
+            if [ -f .size-limit.js ] || grep -q '"size-limit"' package.json 2>/dev/null; then
+              npx --yes size-limit --json > .perf-reports/size-limit.json 2>/dev/null || echo "[]" > .perf-reports/size-limit.json
+            else
+              # .size-limit.json only: size-limit isn't installed in this repo, so measure it ourselves.
+              node .perf-framework/scripts/measure-bundle.mjs > .perf-reports/size-limit.json 2>/dev/null || echo "[]" > .perf-reports/size-limit.json
+            fi
           else
             echo "[]" > .perf-reports/size-limit.json
           fi
