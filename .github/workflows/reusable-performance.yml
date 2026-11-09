@@ -93,6 +93,13 @@ jobs:
           fi
         continue-on-error: true
 
+      - name: Find Chrome for Lighthouse
+        if: ${{ inputs.target-url != '' }}
+        run: |
+          chrome="$(bash .perf-framework/scripts/find-chrome.sh)"
+          if [ -n "$chrome" ]; then echo "CHROME_PATH=$chrome" >> "$GITHUB_ENV"; echo "Using $chrome"; else echo "No Chrome found: Lighthouse will be skipped (reported as partial)."; fi
+        continue-on-error: true
+
       - name: Lighthouse CI
         if: ${{ inputs.target-url != '' }}
         run: |
@@ -115,7 +122,8 @@ jobs:
             fi
             npx --yes size-limit --json > .perf-reports/size-limit.json 2>/dev/null || echo "[]" > .perf-reports/size-limit.json
           else
-            echo "[]" > .perf-reports/size-limit.json
+            # No size-limit config: measure the gzip size of the built JS/CSS instead.
+            node .perf-framework/scripts/bundle-size.mjs > .perf-reports/size-limit.json 2>/dev/null || echo "[]" > .perf-reports/size-limit.json
           fi
         continue-on-error: true
 
