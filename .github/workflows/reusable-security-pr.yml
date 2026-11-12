@@ -176,7 +176,7 @@ jobs:
     name: Supabase/RLS static check
     if: ${{ inputs.supabase-enabled }}
     runs-on: [self-hosted, homelab]
-    timeout-minutes: 5
+    timeout-minutes: 20
     permissions:
       contents: read
     steps:

@@ -56,7 +56,10 @@ jobs:
   check-previous-scan:
     name: Check previous scan (skip unchanged source scans)
     runs-on: ${{ fromJSON(inputs.runner-labels) }}
-    timeout-minutes: 3
+    # The homelab runner's job-started hook waits for the shared build slot
+    # (homelab-ci-lock) and that wait counts against this limit -- 3 minutes
+    # timed out on 2026-11-12 after a 5m19s wait and skipped every source scan.
+    timeout-minutes: 30
     outputs:
       code-unchanged: ${{ steps.check.outputs.code-unchanged }}
     steps:
@@ -97,7 +100,8 @@ jobs:
   gitleaks-history:
     name: Gitleaks (full git history)
     needs: [check-previous-scan]
-    if: ${{ needs.check-previous-scan.outputs.code-unchanged != 'true' }}
+    # !cancelled(): if check-previous-scan itself fails, scan anyway.
+    if: ${{ !cancelled() && needs.check-previous-scan.outputs.code-unchanged != 'true' }}
     runs-on: ${{ fromJSON(inputs.runner-labels) }}
     timeout-minutes: 20
     permissions:
@@ -121,7 +125,8 @@ jobs:
   semgrep:
     name: Semgrep CE (full SAST)
     needs: [check-previous-scan]
-    if: ${{ needs.check-previous-scan.outputs.code-unchanged != 'true' }}
+    # !cancelled(): if check-previous-scan itself fails, scan anyway.
+    if: ${{ !cancelled() && needs.check-previous-scan.outputs.code-unchanged != 'true' }}
     runs-on: ${{ fromJSON(inputs.runner-labels) }}
     timeout-minutes: 20
     permissions:
@@ -152,7 +157,8 @@ jobs:
   trivy:
     name: Trivy (dependencies/config/IaC/Docker)
     needs: [check-previous-scan]
-    if: ${{ needs.check-previous-scan.outputs.code-unchanged != 'true' }}
+    # !cancelled(): if check-previous-scan itself fails, scan anyway.
+    if: ${{ !cancelled() && needs.check-previous-scan.outputs.code-unchanged != 'true' }}
     runs-on: ${{ fromJSON(inputs.runner-labels) }}
     timeout-minutes: 15
     permissions:
@@ -189,9 +195,10 @@ jobs:
   dependency-audit:
     name: Dependency audit
     needs: [check-previous-scan]
-    if: ${{ needs.check-previous-scan.outputs.code-unchanged != 'true' }}
+    # !cancelled(): if check-previous-scan itself fails, scan anyway.
+    if: ${{ !cancelled() && needs.check-previous-scan.outputs.code-unchanged != 'true' }}
     runs-on: ${{ fromJSON(inputs.runner-labels) }}
-    timeout-minutes: 10
+    timeout-minutes: 25
     permissions:
       contents: read
     steps:
@@ -250,9 +257,9 @@ jobs:
   supabase-check:
     name: Supabase/RLS static check
     needs: [check-previous-scan]
-    if: ${{ inputs.supabase-enabled && needs.check-previous-scan.outputs.code-unchanged != 'true' }}
+    if: ${{ !cancelled() && inputs.supabase-enabled && needs.check-previous-scan.outputs.code-unchanged != 'true' }}
     runs-on: ${{ fromJSON(inputs.runner-labels) }}
-    timeout-minutes: 5
+    timeout-minutes: 20
     permissions:
       contents: read
     steps:
@@ -390,7 +397,7 @@ jobs:
     needs: [check-previous-scan, gitleaks-history, semgrep, trivy, dependency-audit, supabase-check, zap-baseline, nuclei, nmap]
     if: ${{ always() }}
     runs-on: ${{ fromJSON(inputs.runner-labels) }}
-    timeout-minutes: 10
+    timeout-minutes: 30
     permissions:
       contents: read
     steps:
