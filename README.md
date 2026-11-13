@@ -27,6 +27,14 @@ personal GitHub account. One place to fix a scanner config instead of ~20.
   every app repo gets. They just call the reusable workflows above with that repo's
   `application-id`/`supabase-enabled` filled in — nothing else to maintain per-repo.
 - `docs/security-scoring.md` — the 0–100 scoring formula Mission Control uses.
+- `.github/workflows/reusable-vercel-prebuilt.yml` — not a scanner: builds an app on the
+  homelab runner (`vercel pull` + `vercel build`) and uploads the result with
+  `vercel deploy --prebuilt`, so Vercel spends no build minutes. `target: staging` makes a
+  preview tagged as the `staging` branch and moves the staging alias to it;
+  `target: production` makes a production deployment. Each app calls it from
+  `.github/workflows/homelab-deploy.yml` (copy `templates/homelab-deploy.yml`), which
+  Mission Control dispatches when the app's build mode is `homelab`. Needs the repo secret
+  `VERCEL_TOKEN`; the team id, project id and staging alias go in the caller file.
 
 ## How a repo adopts this (new app checklist)
 

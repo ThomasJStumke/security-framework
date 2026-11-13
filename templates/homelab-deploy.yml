@@ -1,0 +1,51 @@
+name: Homelab deploy
+
+# Builds on the homelab runner and uploads the prebuilt output to Vercel, so
+# Vercel spends no build minutes. Dispatched by Mission Control (Push to
+# staging / Push to Production) when this app's build mode is "homelab".
+# Can also be run by hand from the Actions tab.
+#
+# Needs the repository secret VERCEL_TOKEN.
+# Fill in __VERCEL_ORG_ID__, __VERCEL_PROJECT_ID__ and __STAGING_ALIAS__
+# (the app's <project>-git-staging-<team>.vercel.app hostname, or empty).
+run-name: "Homelab deploy ${{ inputs.target }} ${{ inputs.sha }} [${{ inputs.build_id }}]"
+
+on:
+  workflow_dispatch:
+    inputs:
+      target:
+        description: "staging or production"
+        required: true
+        type: choice
+        options: [staging, production]
+      sha:
+        description: "Full commit SHA (must be on the staging branch)"
+        required: true
+        type: string
+      build_id:
+        description: "Mission Control build id (leave empty for a manual run)"
+        required: false
+        type: string
+        default: ""
+
+permissions:
+  contents: read
+
+concurrency:
+  group: homelab-deploy-${{ inputs.target }}
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    uses: ThomasJStumke/security-framework/.github/workflows/reusable-vercel-prebuilt.yml@main
+    with:
+      target: ${{ inputs.target }}
+      sha: ${{ inputs.sha }}
+      build-id: ${{ inputs.build_id }}
+      branch: staging
+      vercel-org-id: __VERCEL_ORG_ID__
+      vercel-project-id: __VERCEL_PROJECT_ID__
+      staging-alias: __STAGING_ALIAS__
+      node-version: "24"
+    secrets:
+      VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}

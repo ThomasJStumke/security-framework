@@ -1,0 +1,227 @@
+name: Reusable Vercel Prebuilt Deploy
+
+# Builds an app on the homelab runner and uploads the finished output to Vercel
+# ("vercel build" here, then "vercel deploy --prebuilt"), so Vercel spends no
+# build minutes on it. Called by each app's .github/workflows/homelab-deploy.yml,
+# which Mission Control dispatches when that app's build mode is "homelab"
+# (see unity-bridge-core src/lib/homelab-build.server.ts).
+#
+#   target=staging    -> preview deployment of <sha>, tagged as the `staging`
+#                        branch (meta githubCommitRef=staging) and given the
+#                        staging alias, so Mission Control reads it exactly like
+#                        a Vercel-built staging deployment.
+#   target=production -> production deployment of <sha>; Vercel points the
+#                        production domains at it as soon as it is ready.
+#
+# Every deployment carries meta homelabBuildId=<build-id>, which is how Mission
+# Control finds the deployment a dispatch produced.
+#
+# Needs one secret in the calling repo: VERCEL_TOKEN (a Vercel access token
+# scoped to the team that owns the project). The org/team id and project id
+# are plain inputs, they are not secret.
+
+on:
+  workflow_call:
+    inputs:
+      target:
+        description: "staging or production"
+        required: true
+        type: string
+      sha:
+        description: "Full 40-character commit SHA to build."
+        required: true
+        type: string
+      branch:
+        description: "Branch the commit must be on. Recorded as the deployment's githubCommitRef."
+        required: false
+        type: string
+        default: "staging"
+      build-id:
+        description: "Mission Control's id for this build (mc_homelab_builds.id). Stored as deployment meta homelabBuildId."
+        required: false
+        type: string
+        default: ""
+      vercel-org-id:
+        description: "Vercel team id (team_...)."
+        required: true
+        type: string
+      vercel-project-id:
+        description: "Vercel project id (prj_...)."
+        required: true
+        type: string
+      staging-alias:
+        description: "Hostname to point at a staging build, e.g. <project>-git-staging-<team>.vercel.app. Empty = no alias."
+        required: false
+        type: string
+        default: ""
+      node-version:
+        description: "Match the Vercel project's Node.js version setting."
+        required: false
+        type: string
+        default: "24"
+      vercel-cli-version:
+        required: false
+        type: string
+        default: "65.15.0"
+      runner-labels:
+        required: false
+        type: string
+        default: '["self-hosted","homelab"]'
+    secrets:
+      VERCEL_TOKEN:
+        required: true
+    outputs:
+      deployment-url:
+        description: "https:// URL of the new deployment."
+        value: ${{ jobs.deploy.outputs.deployment-url }}
+      deployment-id:
+        description: "Vercel deployment id (dpl_...)."
+        value: ${{ jobs.deploy.outputs.deployment-id }}
+
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    name: Build on homelab, deploy prebuilt to Vercel (${{ inputs.target }})
+    runs-on: ${{ fromJSON(inputs.runner-labels) }}
+    # The homelab job-started hook can wait up to ~55 minutes for the shared
+    # build slot, and that wait counts against this limit.
+    timeout-minutes: 75
+    outputs:
+      deployment-url: ${{ steps.deploy.outputs.url }}
+      deployment-id: ${{ steps.deploy.outputs.id }}
+    env:
+      TARGET: ${{ inputs.target }}
+      SHA: ${{ inputs.sha }}
+      BRANCH: ${{ inputs.branch }}
+      BUILD_ID: ${{ inputs.build-id }}
+      STAGING_ALIAS: ${{ inputs.staging-alias }}
+      VERCEL_ORG_ID: ${{ inputs.vercel-org-id }}
+      VERCEL_PROJECT_ID: ${{ inputs.vercel-project-id }}
+      VERCEL_CLI: vercel@${{ inputs.vercel-cli-version }}
+      VERCEL_TELEMETRY_DISABLED: "1"
+    steps:
+      - name: Check inputs
+        env:
+          HAS_TOKEN: ${{ secrets.VERCEL_TOKEN != '' }}
+        run: |
+          set -euo pipefail
+          case "$TARGET" in staging|production) ;; *) echo "::error::target must be staging or production, got '$TARGET'"; exit 1 ;; esac
+          [[ "$SHA" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::sha must be a full 40-character commit SHA"; exit 1; }
+          [[ "$BRANCH" =~ ^[A-Za-z0-9._/-]+$ ]] || { echo "::error::invalid branch name"; exit 1; }
+          [[ -z "$BUILD_ID" || "$BUILD_ID" =~ ^[0-9a-fA-F-]{1,64}$ ]] || { echo "::error::invalid build-id"; exit 1; }
+          [[ -z "$STAGING_ALIAS" || "$STAGING_ALIAS" =~ ^[a-z0-9.-]+$ ]] || { echo "::error::invalid staging-alias"; exit 1; }
+          [[ "$VERCEL_ORG_ID" =~ ^team_[A-Za-z0-9]+$ ]] || { echo "::error::vercel-org-id must be a team id (team_...)"; exit 1; }
+          [[ "$VERCEL_PROJECT_ID" =~ ^prj_[A-Za-z0-9]+$ ]] || { echo "::error::vercel-project-id must be a project id (prj_...)"; exit 1; }
+          [ "$HAS_TOKEN" = "true" ] || { echo "::error::The VERCEL_TOKEN secret is not set in this repository"; exit 1; }
+
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ inputs.sha }}
+          # Full history: the app's own build reads `git log` (build sha/date),
+          # and the branch check below needs the branch's history.
+          fetch-depth: 0
+
+      - name: Check the commit is on the branch
+        run: |
+          set -euo pipefail
+          git fetch --no-tags origin "+refs/heads/${BRANCH}:refs/remotes/origin/${BRANCH}"
+          if ! git merge-base --is-ancestor "$SHA" "origin/${BRANCH}"; then
+            echo "::error::$SHA is not on origin/${BRANCH}; refusing to deploy it."
+            exit 1
+          fi
+          # A named branch (not a detached HEAD) so the git metadata the Vercel
+          # CLI sends with the deployment names the branch.
+          git checkout -B "$BRANCH" "$SHA"
+          echo "Building $(git log -1 --format='%h %s')"
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: ${{ inputs.node-version }}
+
+      - name: Pull Vercel project settings and environment variables
+        env:
+          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ "$TARGET" = "production" ]; then
+            npx --yes "$VERCEL_CLI" pull --yes --environment=production --token "$VERCEL_TOKEN"
+          else
+            # Preview variables, including any scoped to this branch.
+            npx --yes "$VERCEL_CLI" pull --yes --environment=preview --git-branch="$BRANCH" --token "$VERCEL_TOKEN"
+          fi
+
+      - name: Build (vercel build)
+        env:
+          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+        run: |
+          set -euo pipefail
+          # Runs the project's own install + build commands (vercel.json /
+          # project settings), exactly as a Vercel build machine would.
+          if [ "$TARGET" = "production" ]; then
+            npx --yes "$VERCEL_CLI" build --prod --yes --token "$VERCEL_TOKEN"
+          else
+            npx --yes "$VERCEL_CLI" build --yes --token "$VERCEL_TOKEN"
+          fi
+          test -f .vercel/output/config.json
+          du -sh .vercel/output
+
+      - name: Deploy prebuilt output
+        id: deploy
+        env:
+          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+        run: |
+          set -euo pipefail
+          MESSAGE="$(git log -1 --format=%s | cut -c1-250)"
+          AUTHOR="$(git log -1 --format=%an)"
+          META=(
+            --meta "githubCommitRef=${BRANCH}"
+            --meta "githubCommitSha=${SHA}"
+            --meta "githubCommitMessage=${MESSAGE}"
+            --meta "githubCommitAuthorName=${AUTHOR}"
+            --meta "homelabBuild=1"
+          )
+          if [ -n "$BUILD_ID" ]; then META+=(--meta "homelabBuildId=${BUILD_ID}"); fi
+          if [ "$TARGET" = "staging" ] && [ -n "$STAGING_ALIAS" ]; then
+            META+=(--meta "branchAlias=${STAGING_ALIAS}")
+          fi
+          if [ "$TARGET" = "production" ]; then
+            URL="$(npx --yes "$VERCEL_CLI" deploy --prebuilt --prod --yes "${META[@]}" --token "$VERCEL_TOKEN")"
+          else
+            URL="$(npx --yes "$VERCEL_CLI" deploy --prebuilt --yes "${META[@]}" --token "$VERCEL_TOKEN")"
+          fi
+          URL="$(printf '%s\n' "$URL" | grep -Eo 'https://[^ ]+' | tail -1)"
+          [ -n "$URL" ] || { echo "::error::vercel deploy did not print a deployment URL"; exit 1; }
+          ID="$(npx --yes "$VERCEL_CLI" inspect "$URL" --token "$VERCEL_TOKEN" 2>&1 | grep -Eo 'dpl_[A-Za-z0-9]+' | head -1 || true)"
+          echo "url=$URL" >> "$GITHUB_OUTPUT"
+          echo "id=$ID" >> "$GITHUB_OUTPUT"
+          echo "Deployed $URL ($ID)"
+
+      - name: Point the staging alias at this build
+        if: ${{ inputs.target == 'staging' && inputs.staging-alias != '' }}
+        env:
+          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+          URL: ${{ steps.deploy.outputs.url }}
+        run: |
+          set -euo pipefail
+          npx --yes "$VERCEL_CLI" alias set "$URL" "$STAGING_ALIAS" --token "$VERCEL_TOKEN"
+
+      - name: Summary
+        if: always()
+        env:
+          URL: ${{ steps.deploy.outputs.url }}
+          ID: ${{ steps.deploy.outputs.id }}
+        run: |
+          {
+            echo "### Homelab prebuilt deploy: ${TARGET}"
+            echo ""
+            echo "- Commit: \`${SHA}\` on \`${BRANCH}\`"
+            echo "- Mission Control build id: ${BUILD_ID:-none}"
+            echo "- Deployment: ${URL:-not created} ${ID:+(\`$ID\`)}"
+            if [ "$TARGET" = "staging" ] && [ -n "$STAGING_ALIAS" ]; then echo "- Staging alias: https://${STAGING_ALIAS}"; fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Remove pulled environment variables
+        if: always()
+        run: rm -rf .vercel/.env.*.local .vercel/output
