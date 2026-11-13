@@ -140,6 +140,12 @@ jobs:
         with:
           node-version: ${{ inputs.node-version }}
 
+      # Most fleet apps install with Bun (bun.lock); vercel build picks the
+      # package manager from the lockfile, so Bun must be on the runner's PATH.
+      - name: Set up Bun (bun.lock projects)
+        if: ${{ hashFiles('bun.lock', 'bun.lockb') != '' }}
+        uses: oven-sh/setup-bun@735343b667d3e6f658f44d0eca948eb6282f2b76 # v2
+
       - name: Pull Vercel project settings and environment variables
         env:
           VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
