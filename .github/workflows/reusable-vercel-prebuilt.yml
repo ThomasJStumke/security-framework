@@ -146,10 +146,10 @@ jobs:
         run: |
           set -euo pipefail
           if [ "$TARGET" = "production" ]; then
-            npx --yes "$VERCEL_CLI" pull --yes --environment=production --token "$VERCEL_TOKEN"
+            npx --yes "$VERCEL_CLI" pull --yes --environment=production
           else
             # Preview variables, including any scoped to this branch.
-            npx --yes "$VERCEL_CLI" pull --yes --environment=preview --git-branch="$BRANCH" --token "$VERCEL_TOKEN"
+            npx --yes "$VERCEL_CLI" pull --yes --environment=preview --git-branch="$BRANCH"
           fi
 
       - name: Build (vercel build)
@@ -160,9 +160,9 @@ jobs:
           # Runs the project's own install + build commands (vercel.json /
           # project settings), exactly as a Vercel build machine would.
           if [ "$TARGET" = "production" ]; then
-            npx --yes "$VERCEL_CLI" build --prod --yes --token "$VERCEL_TOKEN"
+            npx --yes "$VERCEL_CLI" build --prod --yes
           else
-            npx --yes "$VERCEL_CLI" build --yes --token "$VERCEL_TOKEN"
+            npx --yes "$VERCEL_CLI" build --yes
           fi
           test -f .vercel/output/config.json
           du -sh .vercel/output
@@ -187,13 +187,13 @@ jobs:
             META+=(--meta "branchAlias=${STAGING_ALIAS}")
           fi
           if [ "$TARGET" = "production" ]; then
-            URL="$(npx --yes "$VERCEL_CLI" deploy --prebuilt --prod --yes "${META[@]}" --token "$VERCEL_TOKEN")"
+            URL="$(npx --yes "$VERCEL_CLI" deploy --prebuilt --prod --yes "${META[@]}")"
           else
-            URL="$(npx --yes "$VERCEL_CLI" deploy --prebuilt --yes "${META[@]}" --token "$VERCEL_TOKEN")"
+            URL="$(npx --yes "$VERCEL_CLI" deploy --prebuilt --yes "${META[@]}")"
           fi
           URL="$(printf '%s\n' "$URL" | grep -Eo 'https://[^ ]+' | tail -1)"
           [ -n "$URL" ] || { echo "::error::vercel deploy did not print a deployment URL"; exit 1; }
-          ID="$(npx --yes "$VERCEL_CLI" inspect "$URL" --token "$VERCEL_TOKEN" 2>&1 | grep -Eo 'dpl_[A-Za-z0-9]+' | head -1 || true)"
+          ID="$(npx --yes "$VERCEL_CLI" inspect "$URL" 2>&1 | grep -Eo 'dpl_[A-Za-z0-9]+' | head -1 || true)"
           echo "url=$URL" >> "$GITHUB_OUTPUT"
           echo "id=$ID" >> "$GITHUB_OUTPUT"
           echo "Deployed $URL ($ID)"
@@ -205,7 +205,7 @@ jobs:
           URL: ${{ steps.deploy.outputs.url }}
         run: |
           set -euo pipefail
-          npx --yes "$VERCEL_CLI" alias set "$URL" "$STAGING_ALIAS" --token "$VERCEL_TOKEN"
+          npx --yes "$VERCEL_CLI" alias set "$URL" "$STAGING_ALIAS"
 
       - name: Summary
         if: always()
