@@ -161,6 +161,15 @@ jobs:
       - name: Build (vercel build)
         env:
           VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+          # What Vercel's own build machines set. Frameworks read these to pick their output:
+          # without VERCEL=1, nitro (TanStack Start) falls back to its default preset
+          # (cloudflare-module in the Lovable config) and vercel build finds no output.
+          VERCEL: "1"
+          CI: "1"
+          VERCEL_ENV: ${{ inputs.target == 'production' && 'production' || 'preview' }}
+          VERCEL_GIT_PROVIDER: github
+          VERCEL_GIT_COMMIT_REF: ${{ inputs.branch }}
+          VERCEL_GIT_COMMIT_SHA: ${{ inputs.sha }}
         run: |
           set -euo pipefail
           # Runs the project's own install + build commands (vercel.json /
