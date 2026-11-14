@@ -158,6 +158,22 @@ jobs:
             npx --yes "$VERCEL_CLI" pull --yes --environment=preview --git-branch="$BRANCH"
           fi
 
+      # `vercel pull` cannot read variables marked "Sensitive" in Vercel and writes them as empty.
+      # A browser variable (VITE_ / NEXT_PUBLIC_) that comes back empty is baked into the site as
+      # blank: on 2026-11-14 DareToFish went live with an empty VITE_SUPABASE_URL and every page
+      # crashed. Stop here instead. Prints variable names only, never values.
+      - name: Check browser variables are not blank
+        run: |
+          set -euo pipefail
+          ENV_FILE=".vercel/.env.${{ inputs.target == 'production' && 'production' || 'preview' }}.local"
+          [ -f "$ENV_FILE" ] || { echo "::error::$ENV_FILE was not written by vercel pull"; exit 1; }
+          BLANK="$(grep -E '^(VITE_|NEXT_PUBLIC_)[A-Za-z0-9_]*=("")?$' "$ENV_FILE" | cut -d= -f1 | grep -Ev '^VITE_VERCEL_|^NEXT_PUBLIC_VERCEL_' || true)"
+          if [ -n "$BLANK" ]; then
+            echo "::error::These browser variables came back blank (marked Sensitive in Vercel, or empty): $(echo $BLANK). Re-save them in Vercel as normal (not Sensitive) variables; they end up in the public site code anyway."
+            exit 1
+          fi
+          echo "Browser variables present: $(grep -cE '^(VITE_|NEXT_PUBLIC_)' "$ENV_FILE")"
+
       - name: Build (vercel build)
         env:
           VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
@@ -185,6 +201,32 @@ jobs:
           test -f .vercel/output/config.json
           du -sh .vercel/output
 
+      # Secrets that must never be in files a browser downloads. On 2026-11-14 DareToFish's public
+      # code was found to contain its Resend API key (a VITE_ variable, which Vite inlines).
+      # Prints the file and kind of secret, never the value.
+      - name: Check no secrets in the public site files
+        run: |
+          set -euo pipefail
+          STATIC=".vercel/output/static"
+          [ -d "$STATIC" ] || { echo "No static output, nothing to scan"; exit 0; }
+          FOUND=0
+          check() {
+            local kind="$1" re="$2" files
+            files="$(grep -rlE -- "$re" "$STATIC" 2>/dev/null | head -5 || true)"
+            if [ -n "$files" ]; then echo "::error::$kind found in public files: $(echo $files)"; FOUND=1; fi
+          }
+          check "Resend API key" 're_[A-Za-z0-9]{8}_[A-Za-z0-9]{16,}'
+          check "Stripe secret key" 'sk_(live|test)_[A-Za-z0-9]{16,}'
+          check "Paystack secret key" 'sk_(live|test)_[a-f0-9]{30,}'
+          check "Supabase secret key" 'sb_secret_[A-Za-z0-9_-]{16,}'
+          check "AWS access key" 'AKIA[0-9A-Z]{16}'
+          check "Private key" '-----BEGIN [A-Z ]*PRIVATE KEY-----'
+          if [ "$FOUND" = "1" ]; then
+            echo "::error::Remove the variable from Vercel (or stop the code reading import.meta.env as a whole object), and rotate the exposed key."
+            exit 1
+          fi
+          echo "No known secret patterns in public files"
+
       - name: Deploy prebuilt output
         id: deploy
         env:
@@ -204,7 +246,9 @@ jobs:
           if [ "$TARGET" = "staging" ] && [ -n "$STAGING_ALIAS" ]; then
             META+=(--meta "branchAlias=${STAGING_ALIAS}")
           fi
-          PROD=(); if [ "$TARGET" = "production" ]; then PROD=(--prod); fi
+          # Production is uploaded without moving the domains; it goes live only after the
+          # browser check below passes ("Make it live").
+          PROD=(); if [ "$TARGET" = "production" ]; then PROD=(--prod --skip-domain); fi
           # The upload sometimes drops mid-way on the home connection ("fetch failed"). Retry:
           # Vercel only asks again for files it has not received, so a retry resumes.
           URL=""
@@ -220,6 +264,66 @@ jobs:
           echo "id=$ID" >> "$GITHUB_OUTPUT"
           echo "Deployed $URL ($ID)"
 
+      # Load the new build in a real browser before (production) or right after (staging) it is used.
+      # On 2026-11-14 a build returned 200 for every request while every visitor saw "Something
+      # went wrong". A protected deployment URL (Vercel login wall) cannot be checked: warn, go on.
+      - name: Check the site renders in a browser
+        id: render
+        env:
+          URL: ${{ steps.deploy.outputs.url }}
+        run: |
+          set -euo pipefail
+          PW="$RUNNER_TEMP/render-check"
+          mkdir -p "$PW"
+          npm install --prefix "$PW" --no-save --no-audit --no-fund --silent playwright@1.64.1
+          (cd "$PW" && npx --no-install playwright install chromium-headless-shell >/dev/null)
+          cat > "$PW/check.cjs" <<'JS'
+          const { chromium } = require("playwright");
+          const ERR = /Something went wrong|Application error|This page didn't load|Internal Server Error/i;
+          (async () => {
+            const url = process.argv[2];
+            const browser = await chromium.launch({ args: ["--disable-dev-shm-usage"] });
+            const ctx = await browser.newContext({ serviceWorkers: "block" });
+            const page = await ctx.newPage();
+            const errs = [];
+            page.on("pageerror", (e) => errs.push(e.message.slice(0, 200)));
+            let out = "ok";
+            try {
+              const res = await page.goto(url, { waitUntil: "load", timeout: 45000 });
+              await page.waitForLoadState("networkidle", { timeout: 15000 }).catch(() => {});
+              await page.waitForTimeout(2000);
+              const host = new URL(page.url()).hostname;
+              const text = (await page.locator("body").innerText().catch(() => "")) || "";
+              if (host === "vercel.com" || host.endsWith(".vercel.com")) out = "protected";
+              else if (!res || res.status() >= 500) out = "fail: HTTP " + (res ? res.status() : "none");
+              else if (ERR.test(text)) out = "fail: error screen \"" + text.match(ERR)[0] + "\"" + (errs[0] ? ": " + errs[0] : "");
+              else if (text.trim().length < 20) out = "fail: page rendered nothing" + (errs[0] ? ": " + errs[0] : "");
+            } catch (e) {
+              out = "fail: " + String(e.message).split("\n")[0];
+            }
+            await browser.close();
+            console.log(out);
+          })();
+          JS
+          RESULT=""
+          for attempt in 1 2; do
+            RESULT="$(node "$PW/check.cjs" "$URL")"
+            case "$RESULT" in fail*) [ "$attempt" = 1 ] && sleep 20 ;; *) break ;; esac
+          done
+          rm -rf "$PW"
+          echo "Browser check: $RESULT"
+          case "$RESULT" in
+            ok) ;;
+            protected) echo "::warning::The deployment URL is behind Vercel's login, so the browser check could not run." ;;
+            *)
+              if [ "$TARGET" = "production" ]; then
+                echo "::error::The new build does not render ($RESULT). It was NOT made live; production is unchanged."
+              else
+                echo "::error::The new staging build does not render ($RESULT)."
+              fi
+              exit 1 ;;
+          esac
+
       - name: Point the staging alias at this build
         if: ${{ inputs.target == 'staging' && inputs.staging-alias != '' }}
         env:
@@ -228,6 +332,16 @@ jobs:
         run: |
           set -euo pipefail
           npx --yes "$VERCEL_CLI" alias set "$URL" "$STAGING_ALIAS"
+
+      - name: Make it live (production)
+        if: ${{ inputs.target == 'production' }}
+        env:
+          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+          URL: ${{ steps.deploy.outputs.url }}
+        run: |
+          set -euo pipefail
+          npx --yes "$VERCEL_CLI" promote "$URL" --yes --timeout=5m
+          echo "Production domains now point at $URL"
 
       - name: Summary
         if: always()
