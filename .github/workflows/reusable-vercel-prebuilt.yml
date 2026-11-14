@@ -204,11 +204,15 @@ jobs:
           if [ "$TARGET" = "staging" ] && [ -n "$STAGING_ALIAS" ]; then
             META+=(--meta "branchAlias=${STAGING_ALIAS}")
           fi
-          if [ "$TARGET" = "production" ]; then
-            URL="$(npx --yes "$VERCEL_CLI" deploy --prebuilt --prod --yes "${META[@]}")"
-          else
-            URL="$(npx --yes "$VERCEL_CLI" deploy --prebuilt --yes "${META[@]}")"
-          fi
+          PROD=(); if [ "$TARGET" = "production" ]; then PROD=(--prod); fi
+          # The upload sometimes drops mid-way on the home connection ("fetch failed"). Retry:
+          # Vercel only asks again for files it has not received, so a retry resumes.
+          URL=""
+          for attempt in 1 2 3; do
+            if URL="$(npx --yes "$VERCEL_CLI" deploy --prebuilt "${PROD[@]}" --yes "${META[@]}")"; then break; fi
+            URL=""
+            if [ "$attempt" -lt 3 ]; then echo "::warning::Upload attempt $attempt failed, retrying in $((attempt * 15))s"; sleep $((attempt * 15)); fi
+          done
           URL="$(printf '%s\n' "$URL" | grep -Eo 'https://[^ ]+' | tail -1)"
           [ -n "$URL" ] || { echo "::error::vercel deploy did not print a deployment URL"; exit 1; }
           ID="$(npx --yes "$VERCEL_CLI" inspect "$URL" 2>&1 | grep -Eo 'dpl_[A-Za-z0-9]+' | head -1 || true)"
