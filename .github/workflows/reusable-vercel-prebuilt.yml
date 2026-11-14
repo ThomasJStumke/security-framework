@@ -185,6 +185,24 @@ jobs:
                 const m = /^([A-Z0-9_]+)=(.*)$/.exec(line.trim());
                 if (m && CLIENT.test(m[1]) && m[2].replace(/^"|"$/g, "") === "") bad.add(m[1]);
               }
+            // Only variables the app's code reads matter: a blank one nothing uses (e.g. a team-wide
+            // shared variable linked to every project) can't break the site. Code reads a variable by
+            // naming it (import.meta.env.X, import.meta.env["X"], env["X"]), so a name that appears
+            // nowhere in the source is never read. If the code builds names ("VITE_" + x), every
+            // variable counts.
+            const SKIP = new Set(["node_modules", ".git", ".vercel", ".claude", "dist", "build", ".output", ".next", "android", "ios", "coverage"]);
+            const EXT = /\.(c|m)?(j|t)sx?$|\.(vue|svelte|astro|html)$/;
+            let src = "";
+            (function walk(dir) {
+              for (const d of fs.readdirSync(dir, { withFileTypes: true })) {
+                if (d.isDirectory()) { if (!SKIP.has(d.name)) walk(`${dir}/${d.name}`); }
+                else if (EXT.test(d.name)) src += fs.readFileSync(`${dir}/${d.name}`, "utf8") + "\n";
+              }
+            })(".");
+            const builtNames = /["'`](VITE_|NEXT_PUBLIC_|PUBLIC_|NUXT_PUBLIC_|EXPO_PUBLIC_)["'`]\s*\+|`(VITE_|NEXT_PUBLIC_|PUBLIC_|NUXT_PUBLIC_|EXPO_PUBLIC_)\$\{/.test(src);
+            if (!builtNames)
+              for (const k of [...bad])
+                if (!src.includes(k)) { console.log(`Ignoring ${k}: Sensitive or blank in Vercel, but the code never reads it.`); bad.delete(k); }
             if (bad.size) {
               const list = [...bad].sort().join(", ");
               console.log(`::error::Browser-side variable(s) ${list} are Sensitive (or blank) in Vercel, so this build would ship them empty and the site would break. Re-save them in Vercel as non-sensitive (they are public in the browser anyway), or set this app to build on Vercel. Nothing was deployed.`);
