@@ -158,6 +158,42 @@ jobs:
             npx --yes "$VERCEL_CLI" pull --yes --environment=preview --git-branch="$BRANCH"
           fi
 
+      # Browser-side variables are baked into the bundle at build time. Vercel never hands a
+      # "Sensitive" variable's value to an outside build, so it would ship blank: on 2026-11-14 a
+      # homelab build of DareToFish shipped VITE_SUPABASE_URL empty and every page broke. Refuse
+      # to build instead (production is left alone); the app can build on Vercel meanwhile.
+      - name: Check browser-side variables are readable
+        env:
+          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+        run: |
+          set -euo pipefail
+          ENV_TARGET=$([ "$TARGET" = "production" ] && echo production || echo preview)
+          node - "$ENV_TARGET" <<'JS'
+          const fs = require("node:fs");
+          const target = process.argv[2];
+          const CLIENT = /^(VITE_|NEXT_PUBLIC_|PUBLIC_|NUXT_PUBLIC_|EXPO_PUBLIC_)/;
+          const bad = new Set();
+          (async () => {
+            const url = `https://api.vercel.com/v10/projects/${process.env.VERCEL_PROJECT_ID}/env?teamId=${process.env.VERCEL_ORG_ID}`;
+            const res = await fetch(url, { headers: { Authorization: `Bearer ${process.env.VERCEL_TOKEN}` } });
+            if (!res.ok) throw new Error(`Vercel env list: HTTP ${res.status}`);
+            for (const e of (await res.json()).envs ?? [])
+              if (CLIENT.test(e.key) && e.type === "sensitive" && (e.target ?? []).includes(target)) bad.add(e.key);
+            const file = `.vercel/.env.${target}.local`;
+            if (fs.existsSync(file))
+              for (const line of fs.readFileSync(file, "utf8").split("\n")) {
+                const m = /^([A-Z0-9_]+)=(.*)$/.exec(line.trim());
+                if (m && CLIENT.test(m[1]) && m[2].replace(/^"|"$/g, "") === "") bad.add(m[1]);
+              }
+            if (bad.size) {
+              const list = [...bad].sort().join(", ");
+              console.log(`::error::Browser-side variable(s) ${list} are Sensitive (or blank) in Vercel, so this build would ship them empty and the site would break. Re-save them in Vercel as non-sensitive (they are public in the browser anyway), or set this app to build on Vercel. Nothing was deployed.`);
+              process.exit(1);
+            }
+            console.log("Browser-side variables are readable.");
+          })().catch((e) => { console.log(`::error::${e.message}`); process.exit(1); });
+          JS
+
       - name: Build (vercel build)
         env:
           VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
