@@ -113,8 +113,18 @@ jobs:
       - name: Run Gitleaks against full history
         run: |
           mkdir -p .security-reports
-          docker run --rm -v "$PWD:/repo" zricethezav/gitleaks:v8.18.4 detect \
-            --source=/repo --report-format=json --report-path=/repo/.security-reports/gitleaks.json --exit-code=0 || true
+          # Homelab build runners run as an account with no Docker access (runner isolation,
+          # 2026-11-15); there the scanner runs through homelab-scan-tool, a root-owned wrapper
+          # that only runs this pinned image on this job's workspace (homelab/ in this repo).
+          if docker info >/dev/null 2>&1; then
+            docker run --rm -v "$PWD:/repo" zricethezav/gitleaks:v8.18.4 detect \
+              --source=/repo --report-format=json --report-path=/repo/.security-reports/gitleaks.json --exit-code=0 || true
+          elif sudo -n /usr/local/sbin/homelab-scan-tool check >/dev/null 2>&1; then
+            sudo -n /usr/local/sbin/homelab-scan-tool gitleaks "$PWD" || true
+          else
+            echo "::error::No Docker access and homelab-scan-tool is not installed, so Gitleaks did not run."
+            exit 1
+          fi
         continue-on-error: true
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
@@ -287,7 +297,24 @@ jobs:
       contents: read
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      # Homelab build runners have no Docker access (runner isolation, 2026-11-15), and the ZAP
+      # action needs it. There the same passive baseline runs through homelab-scan-tool instead.
+      - name: Check Docker access
+        id: docker
+        run: |
+          if docker info >/dev/null 2>&1; then echo "direct=true" >> "$GITHUB_OUTPUT"; else echo "direct=false" >> "$GITHUB_OUTPUT"; fi
+      - name: ZAP Baseline Scan via homelab-scan-tool (passive only)
+        if: ${{ steps.docker.outputs.direct != 'true' }}
+        env:
+          SCAN_URL: ${{ inputs.scan-url }}
+        run: |
+          if ! sudo -n /usr/local/sbin/homelab-scan-tool check >/dev/null 2>&1; then
+            echo "::error::No Docker access and homelab-scan-tool is not installed, so ZAP did not run."
+            exit 1
+          fi
+          sudo -n /usr/local/sbin/homelab-scan-tool zap "$PWD" "$SCAN_URL"
       - name: ZAP Baseline Scan (passive only — no active/attack rules)
+        if: ${{ steps.docker.outputs.direct == 'true' }}
         uses: zaproxy/action-baseline@de8ad967d3548d44ef623df22cf95c3b0baf8b25 # v0.15.0
         with:
           target: ${{ inputs.scan-url }}
@@ -322,6 +349,8 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Run Nuclei against confirmed app URL only
+        env:
+          SCAN_URL: ${{ inputs.scan-url }}
         run: |
           mkdir -p .security-reports
           # Vetted, explicitly non-destructive template tags only:
@@ -331,15 +360,26 @@ jobs:
           #   default-creds banners; they don't POST attempted logins).
           # Explicitly excluded: dast, fuzz, intrusive, takeover (some are destructive-adjacent),
           #   and anything tagged "dos".
-          docker run --rm -v "$PWD/.security-reports:/out" projectdiscovery/nuclei:v3.11.1 \
-            -u "${{ inputs.scan-url }}" \
-            -tags exposed-panels,exposure,misconfig,headers,ssl,tech \
-            -etags dos,fuzz,intrusive,takeover \
-            -severity info,low,medium,high,critical \
-            -rl 20 -c 10 \
-            -jsonl -o /out/nuclei.jsonl \
-            -no-interactsh \
-            -silent || true
+          # Homelab build runners run as an account with no Docker access (runner isolation,
+          # 2026-11-15); there the scanner runs through homelab-scan-tool, a root-owned wrapper
+          # that only runs this pinned image on this job's workspace (homelab/ in this repo).
+          if docker info >/dev/null 2>&1; then
+            docker run --rm -v "$PWD/.security-reports:/out" projectdiscovery/nuclei:v3.11.1 \
+              -u "$SCAN_URL" \
+              -tags exposed-panels,exposure,misconfig,headers,ssl,tech \
+              -etags dos,fuzz,intrusive,takeover \
+              -severity info,low,medium,high,critical \
+              -rl 20 -c 10 \
+              -jsonl -o /out/nuclei.jsonl \
+              -no-interactsh \
+              -silent || true
+          elif sudo -n /usr/local/sbin/homelab-scan-tool check >/dev/null 2>&1; then
+            # Same template set, built inside the wrapper.
+            sudo -n /usr/local/sbin/homelab-scan-tool nuclei "$PWD" "$SCAN_URL" || true
+          else
+            echo "::error::No Docker access and homelab-scan-tool is not installed, so Nuclei did not run."
+            exit 1
+          fi
         continue-on-error: true
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:

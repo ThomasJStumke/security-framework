@@ -1,0 +1,89 @@
+#!/bin/bash
+# homelab-scan-tool — lets the isolated GitHub runner account (ghrunner, deliberately NOT in the
+# docker group) run the fleet's Docker-based security scanners, and nothing else.
+#
+# Installed root-owned at /usr/local/sbin/homelab-scan-tool and allowed through sudo for ghrunner
+# only (see install-homelab-scan-tool.sh). Docker access is root access, so this script builds every
+# docker command itself: the caller picks a tool and passes a workspace (and, for URL scanners, a
+# target URL), never images, mounts or docker flags.
+#
+#   homelab-scan-tool check
+#   homelab-scan-tool gitleaks <workspace>        -> <workspace>/.security-reports/gitleaks.json
+#   homelab-scan-tool nuclei   <workspace> <url>  -> <workspace>/.security-reports/nuclei.jsonl
+#   homelab-scan-tool zap      <workspace> <url>  -> <workspace>/report_json.json (+ md, html)
+#
+# Guarantees: images pinned (same as the workflow); only the caller's own job workspace under
+# /srv/gh-runners is mounted (read-only for gitleaks); no docker socket, no --privileged, no host
+# network, all capabilities dropped; Gitleaks and Nuclei run as the calling user (ZAP as the
+# image's own unprivileged zap user); URLs must be plain https.
+set -euo pipefail
+umask 022
+
+RUNNER_ROOT=/srv/gh-runners
+GITLEAKS_IMAGE=zricethezav/gitleaks:v8.18.4
+NUCLEI_IMAGE=projectdiscovery/nuclei:v3.11.1
+ZAP_IMAGE=ghcr.io/zaproxy/zaproxy:stable
+DOCKER=/usr/bin/docker
+
+die() { echo "homelab-scan-tool: $*" >&2; exit 2; }
+[ "$(id -u)" = 0 ] || die "run through sudo"
+CALLER_UID="${SUDO_UID:-}"; CALLER_GID="${SUDO_GID:-}"
+[ -n "$CALLER_UID" ] && [ "$CALLER_UID" != 0 ] || die "must be called through sudo by a non-root user"
+
+tool="${1:-}"
+[ "$tool" = check ] && { "$DOCKER" info >/dev/null 2>&1 && echo ok && exit 0; die "docker not available"; }
+
+workspace() {
+  local w
+  w=$(realpath -e -- "$1" 2>/dev/null) || die "workspace does not exist"
+  case "$w/" in "$RUNNER_ROOT"/*/_work/*) ;; *) die "workspace must be a job folder under $RUNNER_ROOT/*/_work" ;; esac
+  [ "$(stat -c %u -- "$w")" = "$CALLER_UID" ] || die "workspace is not owned by the caller"
+  printf '%s' "$w"
+}
+target_url() {
+  [[ "$1" =~ ^https://[A-Za-z0-9]([A-Za-z0-9.-]{0,251}[A-Za-z0-9])?(:[0-9]{2,5})?(/[A-Za-z0-9._~/?\&=%+-]*)?$ ]] \
+    || die "target must be a plain https:// URL"
+  printf '%s' "$1"
+}
+hand_back() { chown -R "$CALLER_UID:$CALLER_GID" -- "$@" 2>/dev/null || true; }
+
+case "$tool" in
+  gitleaks)
+    [ $# -eq 2 ] || die "usage: gitleaks <workspace>"
+    ws=$(workspace "$2"); out="$ws/.security-reports"; mkdir -p "$out"; hand_back "$out"
+    "$DOCKER" run --rm --network none --cap-drop ALL --security-opt no-new-privileges \
+      --user "$CALLER_UID:$CALLER_GID" -e HOME=/tmp \
+      -v "$ws:/repo:ro" -v "$out:/out" "$GITLEAKS_IMAGE" detect \
+      --source=/repo --report-format=json --report-path=/out/gitleaks.json --exit-code=0
+    hand_back "$out"
+    ;;
+  nuclei)
+    [ $# -eq 3 ] || die "usage: nuclei <workspace> <url>"
+    ws=$(workspace "$2"); url=$(target_url "$3"); out="$ws/.security-reports"; mkdir -p "$out"
+    # Same vetted, non-destructive template set as the workflow.
+    "$DOCKER" run --rm --cap-drop ALL --security-opt no-new-privileges \
+      --user "$CALLER_UID:$CALLER_GID" -e HOME=/tmp -v "$out:/out" "$NUCLEI_IMAGE" \
+      -u "$url" -tags exposed-panels,exposure,misconfig,headers,ssl,tech \
+      -etags dos,fuzz,intrusive,takeover -severity info,low,medium,high,critical \
+      -rl 20 -c 10 -jsonl -o /out/nuclei.jsonl -no-interactsh -silent
+    hand_back "$out"
+    ;;
+  zap)
+    [ $# -eq 3 ] || die "usage: zap <workspace> <url>"
+    ws=$(workspace "$2"); url=$(target_url "$3")
+    tmp=$(mktemp -d /tmp/homelab-zap.XXXXXX); trap 'rm -rf "$tmp"' EXIT
+    chown 1000:1000 "$tmp"   # the image's zap user writes its reports here
+    # Passive baseline only (-a includes alpha passive rules, -j AJAX spider). -I: warnings are
+    # findings for Mission Control, not a failed scan.
+    set +e
+    "$DOCKER" run --rm --cap-drop ALL --security-opt no-new-privileges -v "$tmp:/zap/wrk:rw" \
+      "$ZAP_IMAGE" zap-baseline.py -t "$url" -J report_json.json -w report_md.md -r report_html.html -a -j -I
+    rc=$?
+    set -e
+    for f in report_json.json report_md.md report_html.html; do
+      [ -f "$tmp/$f" ] && install -m 644 -o "$CALLER_UID" -g "$CALLER_GID" "$tmp/$f" "$ws/$f"
+    done
+    [ -f "$ws/report_json.json" ] || die "ZAP produced no report (exit $rc)"
+    ;;
+  *) die "unknown tool '${tool}' (check | gitleaks | nuclei | zap)" ;;
+esac
