@@ -141,22 +141,26 @@ jobs:
     timeout-minutes: 20
     permissions:
       contents: read
-    container:
-      image: semgrep/semgrep:1.78.0
-      # Self-hosted runners reuse the same on-disk workspace across jobs in a run
-      # (unlike ubuntu-latest's fresh VM per job) -- a container running as root
-      # (the image default) leaves root-owned files that break the next job's
-      # checkout cleanup with EACCES. Run as the homelab runner's own uid when
-      # self-hosted; harmless no-op string on ubuntu-latest since it never opts in.
-      options: ${{ contains(inputs.runner-labels, 'self-hosted') && '--user 1000:1000' || '' }}
+    # Semgrep runs from its pinned image as this runner's own user (a root container leaves
+    # root-owned files that break the next job's checkout on self-hosted runners). The homelab build
+    # runners have no Docker access (runner isolation, 2026-11-15), so there it goes through
+    # homelab-scan-tool; the job used to be a `container:` job, which needs Docker just to start.
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - run: |
           mkdir -p .security-reports
-          semgrep scan \
-            --config p/security-audit --config p/secrets --config p/owasp-top-ten \
-            --config p/typescript --config p/react \
-            --json --output=.security-reports/semgrep.json --error || true
+          if docker info >/dev/null 2>&1; then
+            docker run --rm --user "$(id -u):$(id -g)" -e HOME=/tmp -v "$PWD:/src" -w /src semgrep/semgrep:1.78.0 \
+              semgrep scan \
+              --config p/security-audit --config p/secrets --config p/owasp-top-ten \
+              --config p/typescript --config p/react \
+              --json --output=.security-reports/semgrep.json --error || true
+          elif sudo -n /usr/local/sbin/homelab-scan-tool check >/dev/null 2>&1; then
+            sudo -n /usr/local/sbin/homelab-scan-tool semgrep "$PWD" || true
+          else
+            echo "::error::No Docker access and homelab-scan-tool is not installed, so Semgrep did not run."
+            exit 1
+          fi
         continue-on-error: true
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:

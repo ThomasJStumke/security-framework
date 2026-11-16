@@ -1,6 +1,6 @@
 #!/bin/bash
 # Installs homelab-scan-tool so the isolated runner account can run the security scanners
-# (ZAP, Gitleaks, Nuclei) without being in the docker group. Safe to run again.
+# (ZAP, Gitleaks, Semgrep, Nuclei) without being in the docker group. Safe to run again.
 #
 #   sudo bash install-homelab-scan-tool.sh
 #
@@ -24,6 +24,6 @@ visudo -c >/dev/null
 
 echo "Installed. Check as the runner user:"
 sudo -u "$RUN_USER" sudo -n /usr/local/sbin/homelab-scan-tool check
-for img in zricethezav/gitleaks:v8.18.4 projectdiscovery/nuclei:v3.11.1 ghcr.io/zaproxy/zaproxy:stable; do
+for img in zricethezav/gitleaks:v8.18.4 semgrep/semgrep:1.78.0 projectdiscovery/nuclei:v3.11.1 ghcr.io/zaproxy/zaproxy:stable; do
   docker pull -q "$img" >/dev/null && echo "  image ready: $img"
 done

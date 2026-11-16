@@ -9,6 +9,7 @@
 #
 #   homelab-scan-tool check
 #   homelab-scan-tool gitleaks <workspace>        -> <workspace>/.security-reports/gitleaks.json
+#   homelab-scan-tool semgrep  <workspace>        -> <workspace>/.security-reports/semgrep.json
 #   homelab-scan-tool nuclei   <workspace> <url>  -> <workspace>/.security-reports/nuclei.jsonl
 #   homelab-scan-tool zap      <workspace> <url>  -> <workspace>/report_json.json (+ md, html)
 #
@@ -22,6 +23,7 @@ umask 022
 RUNNER_ROOT=/srv/gh-runners
 GITLEAKS_IMAGE=zricethezav/gitleaks:v8.18.4
 NUCLEI_IMAGE=projectdiscovery/nuclei:v3.11.1
+SEMGREP_IMAGE=semgrep/semgrep:1.78.0
 ZAP_IMAGE=ghcr.io/zaproxy/zaproxy:stable
 DOCKER=/usr/bin/docker
 
@@ -57,6 +59,18 @@ case "$tool" in
       --source=/repo --report-format=json --report-path=/out/gitleaks.json --exit-code=0
     hand_back "$out"
     ;;
+  semgrep)
+    [ $# -eq 2 ] || die "usage: semgrep <workspace>"
+    ws=$(workspace "$2"); mkdir -p "$ws/.security-reports"; hand_back "$ws/.security-reports"
+    # Same rule packs as the workflow. Exit 1 only means findings were found (--error).
+    set +e
+    "$DOCKER" run --rm --cap-drop ALL --security-opt no-new-privileges \
+      --user "$CALLER_UID:$CALLER_GID" -e HOME=/tmp -v "$ws:/src" -w /src "$SEMGREP_IMAGE" \
+      semgrep scan --config p/security-audit --config p/secrets --config p/owasp-top-ten \
+      --config p/typescript --config p/react --json --output=.security-reports/semgrep.json --error
+    set -e
+    [ -f "$ws/.security-reports/semgrep.json" ] || die "Semgrep produced no report"
+    ;;
   nuclei)
     [ $# -eq 3 ] || die "usage: nuclei <workspace> <url>"
     ws=$(workspace "$2"); url=$(target_url "$3"); out="$ws/.security-reports"; mkdir -p "$out"
@@ -89,5 +103,5 @@ case "$tool" in
     done
     [ -f "$ws/report_json.json" ] || die "ZAP produced no report (exit $rc)"
     ;;
-  *) die "unknown tool '${tool}' (check | gitleaks | nuclei | zap)" ;;
+  *) die "unknown tool '${tool}' (check | gitleaks | semgrep | nuclei | zap)" ;;
 esac
