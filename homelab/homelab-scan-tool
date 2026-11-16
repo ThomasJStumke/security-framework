@@ -71,7 +71,11 @@ case "$tool" in
   zap)
     [ $# -eq 3 ] || die "usage: zap <workspace> <url>"
     ws=$(workspace "$2"); url=$(target_url "$3")
-    tmp=$(mktemp -d /tmp/homelab-zap.XXXXXX); trap 'rm -rf "$tmp"' EXIT
+    # Not under /tmp: the runner services have a private /tmp (PrivateTmp=yes), so a folder made
+    # there is invisible to the Docker daemon, which would mount an empty root-owned folder instead
+    # and ZAP could not write its report (2026-11-16).
+    mkdir -p -m 711 /var/lib/homelab-scan-tool
+    tmp=$(mktemp -d /var/lib/homelab-scan-tool/zap.XXXXXX); trap 'rm -rf "$tmp"' EXIT
     chown 1000:1000 "$tmp"   # the image's zap user writes its reports here
     # Passive baseline only (-a includes alpha passive rules, -j AJAX spider). -I: warnings are
     # findings for Mission Control, not a failed scan.
