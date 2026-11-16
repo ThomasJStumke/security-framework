@@ -129,5 +129,20 @@ test("service_role reference under src/routes/api/ but OUTSIDE a server.handlers
   assert.equal(leak[0].severity, "critical");
 });
 
+test("RLS and policies applied in PL/pgSQL loops (execute format ... %I) are recognised", () => {
+  // Regression for Expense Tracker (2026-11-16): tables set up in a `for t in ... loop` were all
+  // reported as "has no RLS enabled" (critical) although RLS was on in the database.
+  const findings = run("rls-in-loops");
+  const noRls = findingsMatching(findings, (f) => f.title.includes("no RLS")).map((f) => f.metadata.table);
+  assert.deepEqual(noRls, ["loop_forgotten"], "only the table no loop covers is missing RLS");
+  const noPolicies = findingsMatching(findings, (f) => f.title.includes("no policies found")).map((f) => f.metadata.table);
+  assert.deepEqual(noPolicies, ["loop_declared"], "a declared text[] loop enables RLS; it has no policy");
+  const missing = findingsMatching(findings, (f) => f.title.includes("has no") && f.metadata?.command);
+  assert.ok(!missing.some((f) => f.metadata.table === "loop_members"), "a FOR ALL policy from a loop covers every command");
+  assert.ok(missing.some((f) => f.metadata.table === "loop_readonly" && f.metadata.command === "insert"));
+  const permissive = findingsMatching(findings, (f) => f.title.includes("Overly permissive")).map((f) => f.metadata.table);
+  assert.deepEqual(permissive, ["loop_foreach"], "a USING (true) policy written in a loop is still flagged");
+});
+
 console.log(`\n${passed} passed, ${failed} failed`);
 if (failed > 0) process.exit(1);

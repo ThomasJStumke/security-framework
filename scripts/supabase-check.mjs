@@ -50,6 +50,42 @@ function stripSqlComments(sql) {
     .join("\n");
 }
 
+// Many migrations apply the same RLS setup to several tables in a PL/pgSQL loop:
+//   for t in select unnest(array['a', 'b']) loop
+//     execute format('alter table public.%I enable row level security', t);
+//     execute format($p$create policy "x" on public.%I for select using (...)$p$, t);
+//   end loop;
+// (also `foreach t in array array[...]` and `foreach t in array some_var`, where some_var is a
+// declared `text[] := array[...]`). The plain regexes below can't see through %I, so these
+// tables were reported as having no RLS at all (2026-11-16: 19 false "critical" findings on
+// Expense Tracker). This writes each loop's format() statements out once per table name and
+// appends them, so the normal matching sees ordinary statements. Loops whose table list can't
+// be read statically (e.g. `for r in select ... from pg_tables`) are left alone.
+function expandTableLoops(sql) {
+  const namesIn = (text) => [...text.matchAll(/'(\w+)'/g)].map((m) => m[1]);
+  const arrays = new Map(); // declared text[] variable -> table names
+  for (const m of sql.matchAll(/\b(\w+)\s+text\s*\[\]\s*(?::=|=|default)\s*array\s*\[([^\]]*)\]/gi)) {
+    arrays.set(m[1].toLowerCase(), namesIn(m[2]));
+  }
+  const out = [];
+  const loop = /\b(?:for|foreach)\s+(\w+)\s+in\s+([\s\S]*?)\bloop\b([\s\S]*?)\bend\s+loop\b/gi;
+  for (const m of sql.matchAll(loop)) {
+    const [, loopVar, header, body] = m;
+    const tables = [];
+    for (const a of header.matchAll(/array\s*\[([^\]]*)\]/gi)) tables.push(...namesIn(a[1]));
+    for (const id of header.matchAll(/\b(\w+)\b/g)) tables.push(...(arrays.get(id[1].toLowerCase()) ?? []));
+    if (tables.length === 0) continue;
+    const fmt = /format\(\s*(?:'((?:[^']|'')*)'|\$(\w*)\$([\s\S]*?)\$\2\$)\s*,\s*(\w+)\s*\)/gi;
+    for (const f of body.matchAll(fmt)) {
+      if (f[4].toLowerCase() !== loopVar.toLowerCase()) continue;
+      const template = f[1] !== undefined ? f[1].replace(/''/g, "'") : f[3];
+      if ((template.match(/%I/g) || []).length !== 1) continue;
+      for (const t of new Set(tables)) out.push(`${template.replace("%I", t)};`);
+    }
+  }
+  return out.length ? `${sql}\n${out.join("\n")}\n` : sql;
+}
+
 async function main() {
   const findings = [];
   const migrationsDir = path.join(repoRoot, "supabase", "migrations");
@@ -73,10 +109,10 @@ async function main() {
     const securityDefinerFns = [];
 
     const policyStmt =
-      /(create|drop)\s+policy\s+(?:if\s+exists\s+)?(?:"([^"]+)"|(\S+))\s+on\s+(?:public\.)?["`]?(\w+)["`]?([\s\S]*?);/gi;
+      /(create|drop)\s+policy\s+(?:if\s+exists\s+)?(?:"([^"]+)"|(\S+))\s+on\s+(?:public\.)?["`]?(\w+)(?![\w.])["`]?([\s\S]*?);/gi;
 
     for (const file of sqlFiles) {
-      const sql = stripSqlComments(await readFile(file, "utf8"));
+      const sql = expandTableLoops(stripSqlComments(await readFile(file, "utf8")));
       const rel = path.relative(repoRoot, file);
 
       for (const m of sql.matchAll(/create\s+table\s+(?:if\s+not\s+exists\s+)?(?:public\.)?["`]?(\w+)["`]?/gi)) {
